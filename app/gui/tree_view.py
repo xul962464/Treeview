@@ -17,6 +17,7 @@ from app.phylo.model import TreeModel, TreeNode
 
 
 SCALE_BAR_ID = "__scale_bar__"
+INSET_OVERVIEW_ID = "__inset_overview__"
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,11 @@ class TreeRenderOptions:
     scale_bar_auto: bool = True
     scale_bar_length: float = 0.1
     scale_bar_position: str = "left"
+    inset_overview_enabled: bool = False
+    inset_overview_offset_x: float = 24.0
+    inset_overview_offset_y: float = 24.0
+    inset_overview_scale: float = 0.24
+    inset_overview_branch_width: float = 4.0
 
 
 @dataclass
@@ -212,6 +218,28 @@ class GroupAnnotationItem(QGraphicsRectItem):
             self._on_moved(self._group_id, self.pos().x(), self.pos().y())
 
 
+class InsetOverviewItem(QGraphicsRectItem):
+    def __init__(self, on_moved) -> None:
+        super().__init__()
+        self._on_moved = on_moved
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setBrush(QBrush(Qt.GlobalColor.transparent))
+        self.setPen(QPen(QColor(30, 41, 59, 38), 1.0))
+        self.setZValue(20.0)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        self._on_moved(self.pos().x(), self.pos().y())
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            selected = bool(value)
+            self.setPen(QPen(QColor("#2563eb") if selected else QColor(30, 41, 59, 38), 1.2 if selected else 1.0))
+            self.setBrush(QBrush(QColor(37, 99, 235, 18) if selected else Qt.GlobalColor.transparent))
+        return super().itemChange(change, value)
+
+
 class TreeView(QGraphicsView):
     nodeClicked = Signal(str)
     selectionChanged = Signal(list)
@@ -224,6 +252,8 @@ class TreeView(QGraphicsView):
     scaleBarEdited = Signal(str, str)
     groupMoved = Signal(str, float, float)
     groupEdited = Signal(str, str, str)
+    insetOverviewMoved = Signal(float, float)
+    insetOverviewScaleChanged = Signal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -265,6 +295,7 @@ class TreeView(QGraphicsView):
         self._group_font: dict[str, QFont] = {}
         self._group_color: dict[str, QColor] = {}
         self._group_anchor_pos: dict[str, QPointF] = {}
+        self._inset_overview_item: InsetOverviewItem | None = None
         self._label_html_provider: Callable[[TreeNode], str] | None = None
         self._annotation_state = AnnotationState()
         self._last_model: TreeModel | None = None
@@ -302,6 +333,7 @@ class TreeView(QGraphicsView):
         self._group_font.clear()
         self._group_color.clear()
         self._group_anchor_pos.clear()
+        self._inset_overview_item = None
         self._current_selected_ids.clear()
         self._support_items: dict[str, QGraphicsTextItem] = {}
 
@@ -351,7 +383,7 @@ class TreeView(QGraphicsView):
         ids: list[str] = []
         for item in self._scene.selectedItems():
             node_id = item.data(0)
-            if isinstance(node_id, str) and node_id:
+            if isinstance(node_id, str) and node_id and node_id != INSET_OVERVIEW_ID:
                 ids.append(node_id)
         uniq = list(dict.fromkeys(ids))
         self._current_selected_ids = set(uniq)
@@ -359,7 +391,7 @@ class TreeView(QGraphicsView):
         self._refresh_node_circle_visibility()
         self.selectionChanged.emit(uniq)
 
-    def _collect_context(self, model: TreeModel) -> RenderContext:
+    def _collect_context(self, model: TreeModel, ignore_branch_lengths: bool | None = None) -> RenderContext:
         leaves: list[TreeNode] = []
 
         def collect_all_leaves(node: TreeNode) -> None:
@@ -390,7 +422,9 @@ class TreeView(QGraphicsView):
             walk(node)
             return out
 
-        if self._render_options.ignore_branch_lengths:
+        use_ignore_branch_lengths = self._render_options.ignore_branch_lengths if ignore_branch_lengths is None else bool(ignore_branch_lengths)
+
+        if use_ignore_branch_lengths:
             depth_raw: dict[str, float] = {model.root.id: 0.0}
             max_leaf_depth = 0.0
 
@@ -463,6 +497,7 @@ class TreeView(QGraphicsView):
             self._render_circular(model, context)
         else:
             self._render_rectangular(model, context)
+            self._render_inset_overview(model)
         canvas_rect = QRectF(0.0, 0.0, float(self._render_options.canvas_width), float(self._render_options.canvas_height))
         items_rect = self._scene.itemsBoundingRect().adjusted(-24.0, -24.0, 24.0, 24.0)
         target_rect = items_rect.united(canvas_rect) if not items_rect.isNull() else canvas_rect
@@ -603,7 +638,7 @@ class TreeView(QGraphicsView):
         draw_nodes(model.root)
         self._draw_group_backgrounds_rectangular(context, label_column_left, label_column_width)
         self._draw_groups_rectangular(context, label_column_right, mt + offset_y, ch, ys)
-        self._draw_scale_bar(context, ml + offset_x, float(options.canvas_height) - 30.0 + offset_y)
+        self._draw_scale_bar(context, ml + offset_x, float(options.canvas_height) - 30.0 + offset_y, xs)
 
     def _draw_tip_label_rect(self, node: TreeNode, x: float, y: float, label_column_left: float, align_labels: bool) -> None:
         options = self._render_options
@@ -1030,12 +1065,15 @@ class TreeView(QGraphicsView):
         tri.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self._scene.addItem(tri)
 
-    def _draw_scale_bar(self, context: RenderContext, x_left: float, y: float) -> None:
+    def _draw_scale_bar(self, context: RenderContext, x_left: float, y: float, pixels_per_unit: float | None = None) -> None:
         options = self._render_options
         if not options.scale_bar_visible or options.ignore_branch_lengths or context.max_x <= 0:
             return
         length = options.scale_bar_length if not options.scale_bar_auto else self._nice_scale(context.max_x)
-        width = (length / context.max_x) * max(80.0, float(options.canvas_width) - 320.0)
+        if pixels_per_unit is None:
+            width = (length / context.max_x) * max(80.0, float(options.canvas_width) - 320.0)
+        else:
+            width = length * float(pixels_per_unit)
         if width <= 0:
             return
         x = x_left if options.scale_bar_position == "left" else float(options.canvas_width) - width - 60
@@ -1052,6 +1090,123 @@ class TreeView(QGraphicsView):
         right_tick.setPen(pen)
         self._set_scale_bar_pos(item, x, y)
         self._scene.addItem(item)
+
+    def _draw_inset_scale_bar(self, parent: QGraphicsItem, context: RenderContext, options: TreeRenderOptions, x_left: float, y: float, pixels_per_unit: float) -> None:
+        if context.max_x <= 0:
+            return
+        length = options.scale_bar_length if not options.scale_bar_auto else self._nice_scale(context.max_x)
+        width = length * float(pixels_per_unit)
+        if width <= 0:
+            return
+        x = x_left if options.scale_bar_position == "left" else float(options.canvas_width) - width - 60.0
+        pen = QPen(QColor(options.branch_color))
+        pen.setWidthF(options.branch_width)
+        font = QFont(options.font_family, max(9, options.font_size - 1))
+        color = QColor("#111827")
+        label = QGraphicsSimpleTextItem(f"{length:g}", parent)
+        label.setFont(font)
+        label.setBrush(QBrush(color))
+        parent_scale = max(0.001, float(parent.scale()))
+        label_scale = 1.0 / parent_scale
+        label.setScale(label_scale)
+        label_rect = label.boundingRect()
+        label.setPos(x + width / 2.0 - (label_rect.width() * label_scale) / 2.0, y + 10.0)
+        for x0, y0, x1, y1 in ((x, y, x + width, y), (x, y - 4.0, x, y + 4.0), (x + width, y - 4.0, x + width, y + 4.0)):
+            line = QGraphicsLineItem(x0, y0, x1, y1, parent)
+            line.setPen(pen)
+
+    def _build_inset_render_options(self) -> TreeRenderOptions:
+        options = TreeRenderOptions(**asdict(self._render_options))
+        options.layout_mode = "rectangular"
+        options.ignore_branch_lengths = False
+        options.show_tip_labels = False
+        options.show_support_labels = False
+        options.show_leader_lines = False
+        options.show_node_circles = False
+        options.show_selected_node_circle = False
+        options.scale_bar_visible = True
+        options.view_offset_x = 0.0
+        options.view_offset_y = 0.0
+        options.branch_width = max(0.1, float(self._render_options.inset_overview_branch_width))
+        return options
+
+    def _render_inset_overview(self, model: TreeModel) -> None:
+        options = self._render_options
+        if not options.inset_overview_enabled or options.layout_mode != "rectangular":
+            return
+        inset_options = self._build_inset_render_options()
+        context = self._collect_context(model, ignore_branch_lengths=False)
+        container = InsetOverviewItem(lambda x, y: self.insetOverviewMoved.emit(x, y))
+        container.setData(0, INSET_OVERVIEW_ID)
+        container.setPos(float(options.inset_overview_offset_x), float(options.inset_overview_offset_y))
+        container.setScale(max(0.10, min(0.60, float(options.inset_overview_scale))))
+        self._scene.addItem(container)
+        self._inset_overview_item = container
+
+        label_column_width = max(180.0, self._max_visible_tip_label_width(model) + 20.0)
+        ml, mt, mr, mb = 40.0, 36.0, max(300.0, label_column_width + 120.0), 56.0
+        cw = max(80.0, float(inset_options.canvas_width) - ml - mr)
+        ch = max(80.0, float(inset_options.canvas_height) - mt - mb)
+        xs = cw / context.max_x if context.max_x > 0 else 1.0
+        ys = ch / context.max_y if context.max_y > 0 else 1.0
+
+        def px_x(node_id: str) -> float:
+            return ml + context.x_raw.get(node_id, 0.0) * xs
+
+        def px_y(node_id: str) -> float:
+            if context.max_y <= 0:
+                return mt + ch / 2.0
+            return mt + context.y_raw.get(node_id, 0.0) * ys
+
+        def subtree_leaf_count(node: TreeNode) -> int:
+            if node.is_leaf():
+                return 1
+            return max(1, sum(subtree_leaf_count(child) for child in node.children))
+
+        def draw_edges(node: TreeNode) -> None:
+            if node.is_leaf() or node.collapsed:
+                return
+            x0 = px_x(node.id)
+            ys_ = [px_y(child.id) for child in node.children]
+            if ys_:
+                v = QGraphicsLineItem(x0, min(ys_), x0, max(ys_), container)
+                v_pen = QPen(QColor(self._annotation_state.branch_colors.get(node.id, inset_options.branch_color)))
+                v_pen.setWidthF(inset_options.branch_width)
+                v.setPen(v_pen)
+            for child in node.children:
+                x1, y1 = px_x(child.id), px_y(child.id)
+                h = QGraphicsLineItem(x0, y1, x1, y1, container)
+                h_pen = QPen(QColor(self._annotation_state.branch_colors.get(child.id, inset_options.branch_color)))
+                h_pen.setWidthF(inset_options.branch_width)
+                h.setPen(h_pen)
+                draw_edges(child)
+
+        def draw_nodes(node: TreeNode) -> None:
+            x, y = px_x(node.id), px_y(node.id)
+            if node.collapsed:
+                collapsed_span = max(14.0, float(max(0, subtree_leaf_count(node) - 1)) * ys)
+                self._draw_collapsed_triangle_rect_local(container, x, y, collapsed_span, inset_options.collapsed_triangle_color, inset_options.branch_width)
+            if not node.collapsed:
+                for child in node.children:
+                    draw_nodes(child)
+
+        draw_edges(model.root)
+        draw_nodes(model.root)
+        if context.max_x > 0:
+            self._draw_inset_scale_bar(container, context, inset_options, ml, float(inset_options.canvas_height) - 30.0, xs)
+        bounds = container.childrenBoundingRect().adjusted(-10.0, -10.0, 10.0, 10.0)
+        container.setRect(bounds)
+
+    def _draw_collapsed_triangle_rect_local(self, parent: QGraphicsItem, x: float, y: float, span: float, color_name: str, line_width: float) -> None:
+        color = QColor(color_name)
+        half = max(7.0, span / 2.0)
+        tip_x = x
+        base_x = x + 18.0
+        tri = QGraphicsPolygonItem(QPolygonF([QPointF(tip_x, y), QPointF(base_x, y - half), QPointF(base_x, y + half)]), parent)
+        tri.setBrush(QBrush(color))
+        pen = QPen(color)
+        pen.setWidthF(max(0.8, float(line_width)))
+        tri.setPen(pen)
 
     def _render_circular(self, model: TreeModel, context: RenderContext) -> None:
         options = self._render_options
@@ -1588,6 +1743,20 @@ class TreeView(QGraphicsView):
     def wheelEvent(self, event) -> None:
         if event.angleDelta().y() == 0:
             return super().wheelEvent(event)
+        item = self.scene().itemAt(self.mapToScene(event.position().toPoint()), self.transform())
+        if item is not None:
+            container = item
+            while container is not None and container.data(0) != INSET_OVERVIEW_ID:
+                container = container.parentItem()
+            if container is self._inset_overview_item or (self._inset_overview_item is not None and self._inset_overview_item.isSelected()):
+                base = self._inset_overview_item if self._inset_overview_item is not None else container
+                if base is not None:
+                    delta = 0.02 if event.angleDelta().y() > 0 else -0.02
+                    scale_value = max(0.10, min(0.60, base.scale() + delta))
+                    if abs(scale_value - base.scale()) > 1e-9:
+                        self.insetOverviewScaleChanged.emit(scale_value)
+                    event.accept()
+                    return
         self.scale(1.15 if event.angleDelta().y() > 0 else 1 / 1.15, 1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
 
     def mousePressEvent(self, event) -> None:
@@ -1606,6 +1775,8 @@ class TreeView(QGraphicsView):
                     return
                 node_id = item.data(0)
                 if isinstance(node_id, str) and node_id:
+                    if node_id == INSET_OVERVIEW_ID:
+                        return super().mousePressEvent(event)
                     if node_id == SCALE_BAR_ID:
                         kind = "scale_bar"
                     else:
@@ -1620,7 +1791,7 @@ class TreeView(QGraphicsView):
             item = self.scene().itemAt(self.mapToScene(event.position().toPoint()), self.transform())
             if item is not None:
                 node_id = item.data(0)
-                if isinstance(node_id, str) and node_id:
+                if isinstance(node_id, str) and node_id and node_id != INSET_OVERVIEW_ID:
                     self.nodeClicked.emit(node_id)
         return super().mousePressEvent(event)
 

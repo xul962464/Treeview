@@ -496,6 +496,8 @@ class MainWindow(QMainWindow):
         self._viewer.scaleBarEdited.connect(self._on_scale_bar_edited)
         self._viewer.groupMoved.connect(self._on_group_moved)
         self._viewer.groupEdited.connect(self._on_group_edited)
+        self._viewer.insetOverviewMoved.connect(self._on_inset_overview_moved)
+        self._viewer.insetOverviewScaleChanged.connect(self._on_inset_overview_scale_changed)
         self._sync_controls_from_options()
         self._sync_node_label_controls()
         self._sync_scale_bar_controls()
@@ -671,6 +673,17 @@ class MainWindow(QMainWindow):
         self._view_offset_y_spin.setSingleStep(5.0)
         self._view_offset_y_spin.valueChanged.connect(self._on_view_offset_y_changed)
         layout.addRow("整体 Y 偏移", self._view_offset_y_spin)
+        self._chk_inset_overview = QCheckBox("显示拓扑副图", self)
+        self._chk_inset_overview.toggled.connect(self._on_inset_overview_changed)
+        layout.addRow(self._chk_inset_overview)
+        self._btn_reset_inset_overview = QPushButton("重置副图位置/大小", self)
+        self._btn_reset_inset_overview.clicked.connect(self._reset_inset_overview)
+        layout.addRow(self._btn_reset_inset_overview)
+        self._inset_branch_width_spin = NoWheelDoubleSpinBox(self)
+        self._inset_branch_width_spin.setRange(0.1, 20.0)
+        self._inset_branch_width_spin.setSingleStep(0.1)
+        self._inset_branch_width_spin.valueChanged.connect(self._on_inset_branch_width_changed)
+        layout.addRow("副图线条粗细", self._inset_branch_width_spin)
         return page
 
     def _build_tree_page(self) -> QWidget:
@@ -942,11 +955,13 @@ class MainWindow(QMainWindow):
         self._height_spin.setValue(options.canvas_height)
         self._view_offset_x_spin.setValue(float(options.view_offset_x))
         self._view_offset_y_spin.setValue(float(options.view_offset_y))
+        self._chk_inset_overview.setChecked(bool(options.inset_overview_enabled))
+        self._inset_branch_width_spin.setValue(float(options.inset_overview_branch_width))
         self._chk_scale_bar.setChecked(options.scale_bar_visible)
         self._chk_scale_auto.setChecked(options.scale_bar_auto)
         self._scale_length_spin.setValue(max(0.000001, options.scale_bar_length))
         self._cmb_scale_pos.setCurrentText(options.scale_bar_position)
-        self._scale_length_spin.setEnabled(not options.scale_bar_auto and not options.ignore_branch_lengths)
+        self._scale_length_spin.setEnabled(not options.scale_bar_auto and self._scale_bar_range_available(options))
         self._syncing_controls = False
         self._sync_node_label_controls()
         self._sync_scale_bar_controls()
@@ -1206,7 +1221,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已重做上一步操作。", 4000)
 
     def _set_actions_enabled(self, enabled: bool) -> None:
-        for widget in [self._btn_reroot, self._btn_rotate, self._btn_collapse, self._btn_sort_tree, self._btn_auto_adjust, self._btn_search, self._btn_batch, self._btn_import_config, self._btn_selected_branch_color]:
+        for widget in [self._btn_reroot, self._btn_rotate, self._btn_collapse, self._btn_sort_tree, self._btn_auto_adjust, self._btn_search, self._btn_batch, self._btn_import_config, self._btn_selected_branch_color, self._btn_reset_inset_overview]:
             widget.setEnabled(enabled)
 
     def _on_node_clicked(self, node_id: str) -> None:
@@ -1383,6 +1398,14 @@ class MainWindow(QMainWindow):
         self._btn_reset_node_offset.setEnabled(node is not None and node.id in self._annotations.node_label_offsets)
         self._btn_reset_node_text.setEnabled(node is not None and node.id in self._annotations.node_label_overrides)
         self._syncing_controls = False
+
+    def _scale_bar_range_available(self, options: TreeRenderOptions | None = None) -> bool:
+        options = options or self._current_options()
+        if self._model is None:
+            return False
+        if not options.ignore_branch_lengths:
+            return True
+        return bool(options.inset_overview_enabled and options.layout_mode == "rectangular")
 
     def _scale_bar_available(self) -> bool:
         options = self._current_options()
@@ -1785,8 +1808,36 @@ class MainWindow(QMainWindow):
             return
         self._mutate_view_options(lambda o: setattr(o, "view_offset_y", float(value)))
 
+    def _on_inset_overview_changed(self, checked: bool) -> None:
+        self._mutate_view_options(lambda o: setattr(o, "inset_overview_enabled", checked))
+
+    def _reset_inset_overview(self) -> None:
+        if self._model is None:
+            return
+        before = self._capture_history_state()
+        options = self._current_options()
+        changed = (
+            options.inset_overview_offset_x != 24.0
+            or options.inset_overview_offset_y != 24.0
+            or abs(float(options.inset_overview_scale) - 0.24) > 1e-9
+        )
+        options.inset_overview_offset_x = 24.0
+        options.inset_overview_offset_y = 24.0
+        options.inset_overview_scale = 0.24
+        options.inset_overview_branch_width = 4.0
+        self._viewer.set_render_options(options)
+        if changed:
+            self._push_undo_state(before)
+        self._sync_controls_from_options()
+        self._rerender_current_tree()
+
     def _on_scale_bar_visible_changed(self, checked: bool) -> None:
         self._mutate_view_options(lambda o: setattr(o, "scale_bar_visible", checked))
+
+    def _on_inset_branch_width_changed(self, value: float) -> None:
+        if self._syncing_controls:
+            return
+        self._mutate_view_options(lambda o: setattr(o, "inset_overview_branch_width", float(value)))
 
     def _on_scale_bar_auto_changed(self, checked: bool) -> None:
         self._mutate_view_options(lambda o: setattr(o, "scale_bar_auto", checked))
@@ -1814,6 +1865,34 @@ class MainWindow(QMainWindow):
         self._annotations.scale_bar_offset = (float(cur_x), float(value))
         self._push_undo_state(before)
         self._rerender_current_tree()
+
+    def _on_inset_overview_moved(self, x: float, y: float) -> None:
+        if self._model is None:
+            return
+        before = self._capture_history_state()
+        options = self._current_options()
+        if abs(float(options.inset_overview_offset_x) - float(x)) < 1e-9 and abs(float(options.inset_overview_offset_y) - float(y)) < 1e-9:
+            return
+        options.inset_overview_offset_x = float(x)
+        options.inset_overview_offset_y = float(y)
+        self._viewer.set_render_options(options)
+        self._push_undo_state(before)
+        self._sync_controls_from_options()
+        self.statusBar().showMessage("已更新拓扑副图位置。", 3000)
+
+    def _on_inset_overview_scale_changed(self, scale: float) -> None:
+        if self._model is None:
+            return
+        before = self._capture_history_state()
+        options = self._current_options()
+        scale_value = max(0.10, min(0.60, float(scale)))
+        if abs(float(options.inset_overview_scale) - scale_value) < 1e-9:
+            return
+        options.inset_overview_scale = scale_value
+        self._viewer.set_render_options(options)
+        self._push_undo_state(before)
+        self._rerender_current_tree()
+        self.statusBar().showMessage(f"拓扑副图缩放：{scale_value:.2f}", 3000)
 
     def _reset_scale_bar_offset(self) -> None:
         if self._annotations.scale_bar_offset is None:
@@ -2529,7 +2608,26 @@ class MainWindow(QMainWindow):
         if not color.isValid():
             return
         self._push_undo_state(self._capture_history_state())
-        group.color = color.name()
+        old_color = (group.color or "").lower()
+        new_color = color.name()
+        group.color = new_color
+        if group.background_enabled:
+            start = group.background_color_start
+            end = group.background_color_end
+            is_gradient = bool(end and start and end != start)
+            if is_gradient:
+                if start and start.lower() == old_color:
+                    group.background_color_start = new_color
+                if end and end.lower() == old_color:
+                    group.background_color_end = new_color
+                elif end:
+                    group.background_color_end = new_color
+                elif start is None:
+                    group.background_color_start = "#ffffff"
+                    group.background_color_end = new_color
+            else:
+                group.background_color_start = new_color
+                group.background_color_end = None
         self._rerender_current_tree()
 
     def _delete_group(self, group_id: str) -> None:

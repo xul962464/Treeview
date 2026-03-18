@@ -6,8 +6,8 @@ import math
 import re
 from typing import Callable
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSignalBlocker, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QImage, QLinearGradient, QPainter, QPen, QPolygonF, QTextCharFormat, QTextCursor, QTextOption
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSignalBlocker, QSizeF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QImage, QLinearGradient, QPainter, QPageSize, QPen, QPolygonF, QRadialGradient, QTextCharFormat, QTextCursor, QTextOption
 from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsPolygonItem, QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsTextItem, QGraphicsView
@@ -28,8 +28,8 @@ class TreeRenderStats:
 @dataclass
 class TreeRenderOptions:
     layout_mode: str = "rectangular"
-    canvas_width: int = 1600
-    canvas_height: int = 1000
+    canvas_width: int = 1000
+    canvas_height: int = 800
     ignore_branch_lengths: bool = False
     align_tip_labels: bool = False
     show_tip_labels: bool = True
@@ -41,14 +41,18 @@ class TreeRenderOptions:
     font_size: int = 16
     support_font_size: int = 12
     support_color: str = "#4b5563"
-    support_offset_x: float = -20.0
-    support_offset_y: float = -18.0
+    support_offset_x: float = -36.0
+    support_offset_y: float = -22.0
     view_offset_x: float = 0.0
     view_offset_y: float = 0.0
+    circular_start_angle: float = -90.0
+    circular_gap_degrees: float = 18.0
+    circular_label_follow_branch: bool = False
     leader_line_color: str = "#9ca3af"
     leader_line_width: float = 1.0
     branch_color: str = "#000000"
     branch_width: float = 1.2
+    group_line_width: float = 6.0
     node_circle_size: float = 7.2
     node_circle_color: str = "#000000"
     collapsed_triangle_color: str = "#6b7280"
@@ -187,6 +191,27 @@ class ScaleBarItem(QGraphicsRectItem):
             self._on_moved(self.pos().x(), self.pos().y())
 
 
+class GroupAnnotationItem(QGraphicsRectItem):
+    def __init__(self, group_id: str, on_moved) -> None:
+        super().__init__()
+        self._group_id = group_id
+        self._on_moved = on_moved
+        self._editing = False
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setBrush(QBrush(Qt.GlobalColor.transparent))
+        self.setPen(QPen(Qt.GlobalColor.transparent))
+
+    def set_editing(self, editing: bool) -> None:
+        self._editing = editing
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not editing)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if not self._editing:
+            self._on_moved(self._group_id, self.pos().x(), self.pos().y())
+
+
 class TreeView(QGraphicsView):
     nodeClicked = Signal(str)
     selectionChanged = Signal(list)
@@ -197,6 +222,8 @@ class TreeView(QGraphicsView):
     tipLabelEdited = Signal(str, str, str)
     scaleBarMoved = Signal(float, float)
     scaleBarEdited = Signal(str, str)
+    groupMoved = Signal(str, float, float)
+    groupEdited = Signal(str, str, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -211,6 +238,7 @@ class TreeView(QGraphicsView):
         self._current_selected_ids: set[str] = set()
         self._node_items: dict[str, QGraphicsItem] = {}
         self._edge_items: dict[str, list[QGraphicsItem]] = {}
+        self._edge_visible_items: dict[str, list[QGraphicsLineItem]] = {}
         self._label_items: dict[str, QGraphicsTextItem] = {}
         self._label_text: dict[str, str] = {}
         self._label_html: dict[str, str] = {}
@@ -231,6 +259,12 @@ class TreeView(QGraphicsView):
         self._scale_bar_color: QColor | None = None
         self._scale_bar_width = 0.0
         self._scale_bar_line_height = 0.0
+        self._group_items: dict[str, GroupAnnotationItem] = {}
+        self._group_label_items: dict[str, QGraphicsTextItem] = {}
+        self._group_html: dict[str, str] = {}
+        self._group_font: dict[str, QFont] = {}
+        self._group_color: dict[str, QColor] = {}
+        self._group_anchor_pos: dict[str, QPointF] = {}
         self._label_html_provider: Callable[[TreeNode], str] | None = None
         self._annotation_state = AnnotationState()
         self._last_model: TreeModel | None = None
@@ -241,6 +275,7 @@ class TreeView(QGraphicsView):
         self._scene.clear()
         self._node_items.clear()
         self._edge_items.clear()
+        self._edge_visible_items.clear()
         self._label_items.clear()
         self._label_text.clear()
         self._label_html.clear()
@@ -261,6 +296,12 @@ class TreeView(QGraphicsView):
         self._scale_bar_color = None
         self._scale_bar_width = 0.0
         self._scale_bar_line_height = 0.0
+        self._group_items.clear()
+        self._group_label_items.clear()
+        self._group_html.clear()
+        self._group_font.clear()
+        self._group_color.clear()
+        self._group_anchor_pos.clear()
         self._current_selected_ids.clear()
         self._support_items: dict[str, QGraphicsTextItem] = {}
 
@@ -321,18 +362,33 @@ class TreeView(QGraphicsView):
     def _collect_context(self, model: TreeModel) -> RenderContext:
         leaves: list[TreeNode] = []
 
-        def collect(node: TreeNode) -> None:
-            if node.is_leaf() or node.collapsed:
+        def collect_all_leaves(node: TreeNode) -> None:
+            if node.is_leaf():
                 leaves.append(node)
                 return
             for child in node.children:
-                collect(child)
+                collect_all_leaves(child)
 
-        collect(model.root)
+        collect_all_leaves(model.root)
         leaf_order = [node.id for node in leaves]
         leaf_index = {node_id: idx for idx, node_id in enumerate(leaf_order)}
         x_raw: dict[str, float] = {model.root.id: 0.0}
         y_raw: dict[str, float] = {}
+
+        def descendant_leaf_indices(node: TreeNode) -> list[int]:
+            out: list[int] = []
+
+            def walk(cur: TreeNode) -> None:
+                if cur.is_leaf():
+                    idx = leaf_index.get(cur.id)
+                    if idx is not None:
+                        out.append(idx)
+                    return
+                for child in cur.children:
+                    walk(child)
+
+            walk(node)
+            return out
 
         if self._render_options.ignore_branch_lengths:
             depth_raw: dict[str, float] = {model.root.id: 0.0}
@@ -341,8 +397,16 @@ class TreeView(QGraphicsView):
             def walk_depth(node: TreeNode, depth: float) -> None:
                 nonlocal max_leaf_depth
                 depth_raw[node.id] = depth
-                if node.is_leaf() or node.collapsed:
+                if node.is_leaf():
                     y_raw[node.id] = float(leaf_index[node.id])
+                    max_leaf_depth = max(max_leaf_depth, depth)
+                    return
+                if node.collapsed:
+                    indices = descendant_leaf_indices(node)
+                    if indices:
+                        y_raw[node.id] = sum(float(index) for index in indices) / len(indices)
+                    else:
+                        y_raw[node.id] = 0.0
                     max_leaf_depth = max(max_leaf_depth, depth)
                     return
                 for child in node.children:
@@ -368,8 +432,15 @@ class TreeView(QGraphicsView):
 
             def walk(node: TreeNode, parent_x: float) -> None:
                 x_raw[node.id] = parent_x + edge_length(node)
-                if node.is_leaf() or node.collapsed:
+                if node.is_leaf():
                     y_raw[node.id] = float(leaf_index[node.id])
+                    return
+                if node.collapsed:
+                    indices = descendant_leaf_indices(node)
+                    if indices:
+                        y_raw[node.id] = sum(float(index) for index in indices) / len(indices)
+                    else:
+                        y_raw[node.id] = 0.0
                     return
                 for child in node.children:
                     walk(child, x_raw[node.id])
@@ -421,6 +492,8 @@ class TreeView(QGraphicsView):
     def _selection_item_for_node(self, node_id: str) -> QGraphicsItem | None:
         if node_id == SCALE_BAR_ID:
             return self._scale_bar_item
+        if node_id in self._group_items:
+            return self._group_items[node_id]
         if node_id in self._label_items:
             return self._label_items[node_id]
         if node_id in self._node_label_items:
@@ -454,10 +527,12 @@ class TreeView(QGraphicsView):
                 return mt + ch / 2.0 + offset_y
             return mt + context.y_raw.get(node_id, 0.0) * ys + offset_y
 
-        self._draw_group_backgrounds_rectangular(context, label_column_left, label_column_width)
+        def subtree_leaf_count(node: TreeNode) -> int:
+            if node.is_leaf():
+                return 1
+            return max(1, sum(subtree_leaf_count(child) for child in node.children))
+
         self._draw_rectangular_backgrounds(model, px_x, px_y)
-        edge_pen = QPen(QColor(options.branch_color))
-        edge_pen.setWidthF(options.branch_width)
 
         def draw_edges(node: TreeNode) -> None:
             if node.is_leaf() or node.collapsed:
@@ -465,9 +540,12 @@ class TreeView(QGraphicsView):
             x0 = px_x(node.id)
             ys_ = [px_y(child.id) for child in node.children]
             if ys_:
+                v_pen = QPen(QColor(self._annotation_state.branch_colors.get(node.id, options.branch_color)))
+                v_pen.setWidthF(options.branch_width)
                 v = QGraphicsLineItem(x0, min(ys_), x0, max(ys_))
-                v.setPen(edge_pen)
+                v.setPen(v_pen)
                 self._scene.addItem(v)
+                self._edge_visible_items.setdefault(node.id, []).append(v)
                 vh = QGraphicsLineItem(x0, min(ys_), x0, max(ys_))
                 vh.setPen(QPen(QColor(0, 0, 0, 0), 10.0))
                 vh.setData(0, node.id)
@@ -485,17 +563,19 @@ class TreeView(QGraphicsView):
                     self._support_items[node.id] = sup
             for child in node.children:
                 x1, y1 = px_x(child.id), px_y(child.id)
+                h_pen = QPen(QColor(self._annotation_state.branch_colors.get(child.id, options.branch_color)))
+                h_pen.setWidthF(options.branch_width)
                 h = QGraphicsLineItem(x0, y1, x1, y1)
-                h.setPen(edge_pen)
+                h.setPen(h_pen)
                 h.setData(0, child.id)
-                h.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
                 self._scene.addItem(h)
+                self._edge_visible_items.setdefault(child.id, []).append(h)
                 hh = QGraphicsLineItem(x0, y1, x1, y1)
                 hh.setPen(QPen(QColor(0, 0, 0, 0), 10.0))
                 hh.setData(0, child.id)
                 hh.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
                 self._scene.addItem(hh)
-                self._edge_items.setdefault(child.id, []).extend([h, hh])
+                self._edge_items.setdefault(child.id, []).append(hh)
                 draw_edges(child)
 
         def draw_nodes(node: TreeNode) -> None:
@@ -511,7 +591,8 @@ class TreeView(QGraphicsView):
                 self._node_items[node.id] = dot
                 self._node_default_brush[node.id] = dot.brush()
             if node.collapsed:
-                self._draw_collapsed_triangle_rect(node.id, x, y)
+                collapsed_span = max(14.0, float(max(0, subtree_leaf_count(node) - 1)) * ys)
+                self._draw_collapsed_triangle_rect(node.id, x, y, collapsed_span)
             if options.show_tip_labels and (node.is_leaf() or node.collapsed):
                 self._draw_tip_label_rect(node, x, y, label_column_left, align_labels)
             if not node.collapsed:
@@ -520,6 +601,7 @@ class TreeView(QGraphicsView):
 
         draw_edges(model.root)
         draw_nodes(model.root)
+        self._draw_group_backgrounds_rectangular(context, label_column_left, label_column_width)
         self._draw_groups_rectangular(context, label_column_right, mt + offset_y, ch, ys)
         self._draw_scale_bar(context, ml + offset_x, float(options.canvas_height) - 30.0 + offset_y)
 
@@ -579,19 +661,59 @@ class TreeView(QGraphicsView):
         mt = 36.0
         ch = max(80.0, float(options.canvas_height) - mt - 56.0)
         ys = ch / context.max_y if context.max_y > 0 else 1.0
+        pad = max(10.0, ys / 2.0)
 
         def py(index: int) -> float:
             if context.max_y <= 0:
                 return mt + ch / 2.0 + float(options.view_offset_y)
             return mt + float(index) * ys + float(options.view_offset_y)
 
+        def group_leaf_ids(group) -> list[str]:
+            leaf_ids = [leaf_id for leaf_id in (group.leaf_ids or []) if leaf_id in context.leaf_order and leaf_id in self._label_items]
+            if not leaf_ids and 0 <= group.start_leaf_index <= group.end_leaf_index < len(context.leaf_order):
+                leaf_ids = [leaf_id for leaf_id in context.leaf_order[group.start_leaf_index : group.end_leaf_index + 1] if leaf_id in self._label_items]
+            return leaf_ids
+
+        def label_union_rect(group) -> QRectF | None:
+            leaf_ids = group_leaf_ids(group)
+            rect: QRectF | None = None
+            for leaf_id in leaf_ids:
+                item_rect = self._label_items[leaf_id].sceneBoundingRect()
+                rect = item_rect if rect is None else rect.united(item_rect)
+            return rect
+
+        uniform_right = None
+        if options.ignore_branch_lengths or options.align_tip_labels:
+            rights = [item.sceneBoundingRect().right() for item in self._label_items.values()]
+            if rights:
+                uniform_right = max(rights) + 8.0
+
         for group in self._annotation_state.leaf_groups:
             if not group.background_enabled or not group.background_color_start:
                 continue
-            y0, y1 = py(group.start_leaf_index) - 10, py(group.end_leaf_index) + 10
-            x0 = label_column_left - 8 if group.background_scope == "label" else 20 + float(options.view_offset_x)
-            width = (float(options.canvas_width) - x0 - 30) if group.background_scope == "full" else max(220.0, label_column_width + 16.0)
-            rect = QGraphicsRectItem(x0, y0, width, max(20.0, y1 - y0))
+            actual_label_rect = label_union_rect(group)
+            if actual_label_rect is not None:
+                padded_label_rect = actual_label_rect.adjusted(-8.0, -2.0, 8.0, 2.0)
+                first_index = max(0, group.start_leaf_index)
+                last_index = min(len(context.leaf_order) - 1, group.end_leaf_index)
+                y0 = padded_label_rect.top()
+                y1 = padded_label_rect.bottom()
+                if first_index > 0:
+                    y0 = max(y0, (py(first_index - 1) + py(first_index)) / 2.0)
+                if last_index < len(context.leaf_order) - 1:
+                    y1 = min(y1, (py(last_index) + py(last_index + 1)) / 2.0)
+                right_edge = uniform_right if uniform_right is not None else padded_label_rect.right()
+                if group.background_scope == "label":
+                    rect = QGraphicsRectItem(padded_label_rect.left(), y0, max(12.0, right_edge - padded_label_rect.left()), max(6.0, y1 - y0))
+                else:
+                    x0 = 20.0 + float(options.view_offset_x)
+                    rect = QGraphicsRectItem(x0, y0, max(40.0, right_edge - x0), max(20.0, y1 - y0))
+            else:
+                y0, y1 = py(group.start_leaf_index) - pad, py(group.end_leaf_index) + pad
+                background_right = uniform_right if uniform_right is not None else label_column_left - 8 + max(220.0, label_column_width + 16.0)
+                x0 = label_column_left - 8 if group.background_scope == "label" else 20 + float(options.view_offset_x)
+                width = max(40.0, background_right - x0)
+                rect = QGraphicsRectItem(x0, y0, width, max(20.0, y1 - y0))
             if group.background_color_end and group.background_color_end != group.background_color_start:
                 gradient = QLinearGradient(rect.rect().left(), rect.rect().top(), rect.rect().right(), rect.rect().top())
                 c1 = QColor(group.background_color_start)
@@ -609,6 +731,113 @@ class TreeView(QGraphicsView):
             rect.setZValue(-20)
             self._scene.addItem(rect)
 
+    def _group_angle_bounds(self, context: RenderContext, group, angle_for, angle_step: float) -> tuple[float, float] | None:
+        leaf_ids = [leaf_id for leaf_id in (group.leaf_ids or []) if leaf_id in context.leaf_index]
+        if not leaf_ids and 0 <= group.start_leaf_index <= group.end_leaf_index < len(context.leaf_order):
+            leaf_ids = context.leaf_order[group.start_leaf_index : group.end_leaf_index + 1]
+        if not leaf_ids:
+            return None
+        angles = [angle_for(leaf_id) for leaf_id in leaf_ids]
+        if not angles:
+            return None
+        if len(angles) == 1:
+            center_angle = angles[0]
+            pad = max(angle_step / 2.0, math.radians(4.0))
+            return center_angle - pad, center_angle + pad
+        pad = max(angle_step / 2.0, math.radians(1.0))
+        return min(angles) - pad, max(angles) + pad
+
+    def _annular_sector_polygon(self, center: QPointF, inner_radius: float, outer_radius: float, start_angle: float, end_angle: float) -> QPolygonF:
+        sweep = max(0.001, end_angle - start_angle)
+        steps = max(18, int(abs(sweep) * 48.0 / math.pi))
+        points: list[QPointF] = []
+        for index in range(steps + 1):
+            angle = start_angle + sweep * index / steps
+            points.append(QPointF(center.x() + math.cos(angle) * outer_radius, center.y() + math.sin(angle) * outer_radius))
+        for index in range(steps, -1, -1):
+            angle = start_angle + sweep * index / steps
+            points.append(QPointF(center.x() + math.cos(angle) * inner_radius, center.y() + math.sin(angle) * inner_radius))
+        return QPolygonF(points)
+
+    def _draw_group_backgrounds_circular(self, context: RenderContext, center: QPointF, inner_radius: float, outer_radius: float, angle_for, angle_step: float) -> None:
+        options = self._render_options
+        if not self._annotation_state.leaf_groups:
+            return
+        label_outer_radius = outer_radius + (60.0 if options.align_tip_labels else 36.0)
+        label_inner_radius = outer_radius + 6.0
+        uniform_outer_radius = None
+        if options.ignore_branch_lengths or options.align_tip_labels:
+            all_label_radii: list[float] = []
+            for item in self._label_items.values():
+                rect = item.sceneBoundingRect()
+                corners = [rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()]
+                for corner in corners:
+                    all_label_radii.append(math.hypot(corner.x() - center.x(), corner.y() - center.y()))
+            if all_label_radii:
+                uniform_outer_radius = max(all_label_radii) + 8.0
+
+        def label_polar_bounds(group) -> tuple[float, float, float, float] | None:
+            leaf_ids = [leaf_id for leaf_id in (group.leaf_ids or []) if leaf_id in self._label_items]
+            if not leaf_ids and 0 <= group.start_leaf_index <= group.end_leaf_index < len(context.leaf_order):
+                leaf_ids = [leaf_id for leaf_id in context.leaf_order[group.start_leaf_index : group.end_leaf_index + 1] if leaf_id in self._label_items]
+            if not leaf_ids:
+                return None
+            min_radius: float | None = None
+            max_radius: float | None = None
+            for leaf_id in leaf_ids:
+                rect = self._label_items[leaf_id].sceneBoundingRect().adjusted(-4.0, -4.0, 4.0, 4.0)
+                corners = [rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()]
+                for corner in corners:
+                    dx = corner.x() - center.x()
+                    dy = corner.y() - center.y()
+                    radius = math.hypot(dx, dy)
+                    min_radius = radius if min_radius is None else min(min_radius, radius)
+                    max_radius = radius if max_radius is None else max(max_radius, radius)
+            slot_bounds = self._group_angle_bounds(context, group, angle_for, angle_step)
+            if slot_bounds is None or None in {min_radius, max_radius}:
+                return None
+            return slot_bounds[0], slot_bounds[1], min_radius, max_radius
+
+        for group in self._annotation_state.leaf_groups:
+            if not group.background_enabled or not group.background_color_start:
+                continue
+            label_bounds = label_polar_bounds(group)
+            bounds = self._group_angle_bounds(context, group, angle_for, angle_step)
+            if bounds is None:
+                continue
+            start_bound, end_bound = bounds
+            target_outer = uniform_outer_radius if uniform_outer_radius is not None else ((label_bounds[3] + 8.0) if label_bounds is not None else label_outer_radius)
+            if group.background_scope == "full":
+                sector_inner = max(8.0, inner_radius - 2.0)
+                sector_outer = max(label_outer_radius, target_outer)
+            else:
+                if label_bounds is not None:
+                    sector_inner = max(inner_radius, label_bounds[2] - 8.0)
+                    sector_outer = target_outer
+                else:
+                    sector_inner = label_inner_radius
+                    sector_outer = max(label_outer_radius, target_outer)
+            poly = self._annular_sector_polygon(center, sector_inner, sector_outer, start_bound, end_bound)
+            item = QGraphicsPolygonItem(poly)
+            if group.background_color_end and group.background_color_end != group.background_color_start:
+                gradient = QRadialGradient(center, max(1.0, sector_outer))
+                c1 = QColor(group.background_color_start)
+                c2 = QColor(group.background_color_end)
+                c1.setAlphaF(0.2)
+                c2.setAlphaF(0.2)
+                inner_ratio = max(0.0, min(1.0, sector_inner / max(1.0, sector_outer)))
+                gradient.setColorAt(0.0, c1)
+                gradient.setColorAt(inner_ratio, c1)
+                gradient.setColorAt(1.0, c2)
+                item.setBrush(QBrush(gradient))
+            else:
+                color = QColor(group.background_color_start)
+                color.setAlphaF(0.2)
+                item.setBrush(QBrush(color))
+            item.setPen(QPen(Qt.GlobalColor.transparent))
+            item.setZValue(-20)
+            self._scene.addItem(item)
+
     def _group_lane_x_positions(self) -> dict[int, float]:
         if not self._annotation_state.leaf_groups:
             return {}
@@ -616,6 +845,8 @@ class TreeView(QGraphicsView):
         metrics = QFontMetricsF(font)
         lane_widths: dict[int, float] = {}
         for group in self._annotation_state.leaf_groups:
+            if not group.show_marker:
+                continue
             lane_widths[group.level] = max(lane_widths.get(group.level, 0.0), metrics.horizontalAdvance(group.name) + 20.0)
         x_positions: dict[int, float] = {}
         cursor = 20.0
@@ -628,6 +859,17 @@ class TreeView(QGraphicsView):
         if not self._annotation_state.leaf_groups:
             return
         lane_offsets = self._group_lane_x_positions()
+        align_labels = self._render_options.align_tip_labels or self._render_options.ignore_branch_lengths
+
+        def group_label_rect(group) -> QRectF | None:
+            leaf_ids = [leaf_id for leaf_id in (group.leaf_ids or []) if leaf_id in self._label_items]
+            if not leaf_ids and 0 <= group.start_leaf_index <= group.end_leaf_index < len(context.leaf_order):
+                leaf_ids = [leaf_id for leaf_id in context.leaf_order[group.start_leaf_index : group.end_leaf_index + 1] if leaf_id in self._label_items]
+            rect: QRectF | None = None
+            for leaf_id in leaf_ids:
+                item_rect = self._label_items[leaf_id].sceneBoundingRect()
+                rect = item_rect if rect is None else rect.united(item_rect)
+            return rect
 
         def py(index: int) -> float:
             if context.max_y <= 0:
@@ -635,26 +877,144 @@ class TreeView(QGraphicsView):
             return margin_top + float(index) * y_scale
 
         for group in self._annotation_state.leaf_groups:
-            x = label_right_edge + lane_offsets.get(group.level, 20.0)
+            if not group.show_marker:
+                continue
+            label_rect = group_label_rect(group)
+            base_x = label_right_edge if align_labels or label_rect is None else label_rect.right() + 12.0
+            x = base_x + lane_offsets.get(group.level, 20.0)
             y0, y1 = py(group.start_leaf_index), py(group.end_leaf_index)
-            pen = QPen(QColor(group.color))
-            pen.setWidthF(1.4)
-            line = QGraphicsLineItem(x, y0, x, y1)
-            line.setPen(pen)
-            line.setData(1, ("group", group.group_id))
-            self._scene.addItem(line)
-            self._scene.addLine(x - 6, y0, x, y0, pen)
-            self._scene.addLine(x - 6, y1, x, y1, pen)
-            label = QGraphicsSimpleTextItem(group.name)
-            label.setFont(QFont(self._render_options.font_family, max(9, self._render_options.font_size - 1)))
-            label.setBrush(QBrush(QColor(group.color)))
-            label.setPos(x + 4, (y0 + y1) / 2 - 8)
-            label.setData(1, ("group", group.group_id))
-            self._scene.addItem(label)
+            if group.start_leaf_index == group.end_leaf_index:
+                leaf_id = group.leaf_ids[0] if group.leaf_ids else context.leaf_order[group.start_leaf_index]
+                tip_item = self._label_items.get(leaf_id)
+                if tip_item is not None:
+                    rect = tip_item.sceneBoundingRect()
+                    y0, y1 = rect.top(), rect.bottom()
+            self._create_group_annotation_item(group, x, y0, y1)
 
-    def _draw_collapsed_triangle_rect(self, node_id: str, x: float, y: float) -> None:
+    def _draw_groups_circular(self, context: RenderContext, center: QPointF, outer_radius: float, angle_for, angle_step: float) -> None:
+        if not self._annotation_state.leaf_groups:
+            return
+        lane_offsets = self._group_lane_x_positions()
+        max_label_radius = outer_radius + 80.0
+        for item in self._label_items.values():
+            rect = item.sceneBoundingRect()
+            corners = [rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()]
+            for corner in corners:
+                max_label_radius = max(max_label_radius, math.hypot(corner.x() - center.x(), corner.y() - center.y()))
+        base_radius = max_label_radius + 40.0
+        for group in self._annotation_state.leaf_groups:
+            if not group.show_marker:
+                continue
+            bounds = self._group_angle_bounds(context, group, angle_for, angle_step)
+            if bounds is None:
+                continue
+            start_angle, end_angle = bounds
+            radius = base_radius + lane_offsets.get(group.level, 20.0)
+            self._create_group_annotation_item_circular(group, center, radius, start_angle, end_angle)
+
+    def _create_group_annotation_item(self, group, x: float, y0: float, y1: float) -> None:
+        color = QColor(group.color)
+        font = QFont(self._render_options.font_family, max(9, self._render_options.font_size - 1))
+        html_text = group.rich_html if group.rich_html else self._plain_text_html(group.name)
+        item = GroupAnnotationItem(group.group_id, self._emit_group_moved)
+        item.setData(0, group.group_id)
+        item.setData(1, ("group", group.group_id))
+        bar_width = max(2.0, float(self._render_options.group_line_width))
+        label = MovableTextItem(
+            group.group_id,
+            lambda *_: None,
+            lambda gid, plain, html: self.groupEdited.emit(gid, plain, html),
+            movable=False,
+            on_editing_changed=item.set_editing,
+        )
+        label.setParentItem(item)
+        label.setData(0, group.group_id)
+        label.setData(1, ("group", group.group_id))
+        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        label.document().setDefaultFont(font)
+        label.setDefaultTextColor(color)
+        label.setHtml(html_text)
+        label.adjustSize()
+        line_height = max(1.0, abs(y1 - y0))
+        label_height = max(1.0, label.boundingRect().height())
+        content_height = max(line_height, label_height)
+        line_y = (content_height - line_height) / 2.0
+        label_y = (content_height - label_height) / 2.0
+        line = QGraphicsRectItem(-bar_width / 2.0, line_y, bar_width, line_height, item)
+        line.setBrush(QBrush(color))
+        line.setPen(QPen(Qt.GlobalColor.transparent))
+        line.setData(1, ("group", group.group_id))
+        label.setPos(max(8.0, bar_width / 2.0 + 6.0), label_y)
+        width = max(14.0, label.pos().x() + label.boundingRect().width() + 6.0)
+        item.setRect(-bar_width / 2.0 - 2.0, 0.0, width + 2.0, max(1.0, content_height))
+        top = min(y0, y1) - line_y
+        self._group_anchor_pos[group.group_id] = QPointF(x, top)
+        offset = group.offset or (0.0, 0.0)
+        item.setPos(x + float(offset[0]), top + float(offset[1]))
+        self._group_items[group.group_id] = item
+        self._group_label_items[group.group_id] = label
+        self._group_html[group.group_id] = html_text
+        self._group_font[group.group_id] = QFont(font)
+        self._group_color[group.group_id] = QColor(color)
+        self._scene.addItem(item)
+
+    def _create_group_annotation_item_circular(self, group, center: QPointF, radius: float, start_angle: float, end_angle: float) -> None:
+        color = QColor(group.color)
+        font = QFont(self._render_options.font_family, max(9, self._render_options.font_size - 1))
+        html_text = group.rich_html if group.rich_html else self._plain_text_html(group.name)
+        item = GroupAnnotationItem(group.group_id, self._emit_group_moved)
+        item.setData(0, group.group_id)
+        item.setData(1, ("group", group.group_id))
+        mid_angle = (start_angle + end_angle) / 2.0
+        anchor_radius = radius
+        anchor = QPointF(center.x() + math.cos(mid_angle) * anchor_radius, center.y() + math.sin(mid_angle) * anchor_radius)
+        polygon = self._annular_sector_polygon(center, radius, radius + max(2.0, float(self._render_options.group_line_width)), start_angle, end_angle)
+        local_polygon = QPolygonF([point - anchor for point in polygon])
+        band = QGraphicsPolygonItem(local_polygon, item)
+        band.setBrush(QBrush(color))
+        band.setPen(QPen(Qt.GlobalColor.transparent))
+        band.setData(1, ("group", group.group_id))
+        label = MovableTextItem(
+            group.group_id,
+            lambda *_: None,
+            lambda gid, plain, html: self.groupEdited.emit(gid, plain, html),
+            movable=False,
+            on_editing_changed=item.set_editing,
+        )
+        label.setParentItem(item)
+        label.setData(0, group.group_id)
+        label.setData(1, ("group", group.group_id))
+        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        label.document().setDefaultFont(font)
+        label.setDefaultTextColor(color)
+        label.setHtml(html_text)
+        label.adjustSize()
+        text_radius = radius + max(2.0, float(self._render_options.group_line_width)) + 10.0
+        text_anchor = QPointF(center.x() + math.cos(mid_angle) * text_radius, center.y() + math.sin(mid_angle) * text_radius) - anchor
+        width = label.boundingRect().width()
+        height = label.boundingRect().height()
+        if math.cos(mid_angle) >= 0:
+            label.setPos(text_anchor.x() + 4.0, text_anchor.y() - height / 2.0)
+        else:
+            label.setPos(text_anchor.x() - width - 4.0, text_anchor.y() - height / 2.0)
+        bounds = item.childrenBoundingRect().adjusted(-4.0, -4.0, 4.0, 4.0)
+        item.setRect(bounds)
+        self._group_anchor_pos[group.group_id] = anchor
+        offset = group.offset or (0.0, 0.0)
+        item.setPos(anchor.x() + float(offset[0]), anchor.y() + float(offset[1]))
+        self._group_items[group.group_id] = item
+        self._group_label_items[group.group_id] = label
+        self._group_html[group.group_id] = html_text
+        self._group_font[group.group_id] = QFont(font)
+        self._group_color[group.group_id] = QColor(color)
+        self._scene.addItem(item)
+
+    def _draw_collapsed_triangle_rect(self, node_id: str, x: float, y: float, span: float) -> None:
         color = QColor(self._render_options.collapsed_triangle_color)
-        tri = QGraphicsPolygonItem(QPolygonF([QPointF(x + 2, y), QPointF(x + 14, y - 7), QPointF(x + 14, y + 7)]))
+        half = max(7.0, span / 2.0)
+        tip_x = x
+        base_x = x + 18.0
+        tri = QGraphicsPolygonItem(QPolygonF([QPointF(tip_x, y), QPointF(base_x, y - half), QPointF(base_x, y + half)]))
         tri.setBrush(QBrush(color))
         tri.setPen(QPen(color))
         tri.setData(0, node_id)
@@ -700,37 +1060,56 @@ class TreeView(QGraphicsView):
         inner_radius = 26.0
         radius_span = max(50.0, outer_radius - inner_radius)
         max_x = context.max_x if context.max_x > 0 else 1.0
+        start_angle = math.radians(float(options.circular_start_angle))
+        gap_radians = math.radians(max(0.0, min(300.0, float(options.circular_gap_degrees))))
+        angle_span = max(0.01, math.pi * 2 - gap_radians)
 
         def angle_for(node_id: str) -> float:
             idx = context.y_raw.get(node_id, 0.0)
             denom = max(1.0, float(max(len(context.leaf_order) - 1, 1)))
-            return -math.pi / 2 + (idx / denom) * math.pi * 2
+            return start_angle + (idx / denom) * angle_span
+
+        angle_step = angle_span / max(1.0, float(max(len(context.leaf_order) - 1, 1)))
 
         def radius_for(node_id: str) -> float:
             return inner_radius + (context.x_raw.get(node_id, 0.0) / max_x) * radius_span
+
+        def point_at(angle: float, radius: float) -> QPointF:
+            return QPointF(center.x() + math.cos(angle) * radius, center.y() + math.sin(angle) * radius)
 
         coords: dict[str, QPointF] = {}
         for node in model.iter_nodes():
             a = angle_for(node.id)
             r = radius_for(node.id)
-            coords[node.id] = QPointF(center.x() + math.cos(a) * r, center.y() + math.sin(a) * r)
+            coords[node.id] = point_at(a, r)
 
-        pen = QPen(Qt.GlobalColor.black)
-        pen.setWidthF(1.2)
         for node in model.iter_nodes():
             if node.is_leaf() or node.collapsed:
                 continue
             r0 = radius_for(node.id)
             angles = [angle_for(child.id) for child in node.children]
+            arc_pen = QPen(QColor(self._annotation_state.branch_colors.get(node.id, options.branch_color)))
+            arc_pen.setWidthF(options.branch_width)
             steps = max(8, len(node.children) * 6)
             for i in range(steps):
                 a0 = min(angles) + (max(angles) - min(angles)) * i / steps
                 a1 = min(angles) + (max(angles) - min(angles)) * (i + 1) / steps
-                self._scene.addLine(center.x() + math.cos(a0) * r0, center.y() + math.sin(a0) * r0, center.x() + math.cos(a1) * r0, center.y() + math.sin(a1) * r0, pen)
-            p0 = coords[node.id]
+                arc = self._scene.addLine(
+                    center.x() + math.cos(a0) * r0,
+                    center.y() + math.sin(a0) * r0,
+                    center.x() + math.cos(a1) * r0,
+                    center.y() + math.sin(a1) * r0,
+                    arc_pen,
+                )
+                self._edge_visible_items.setdefault(node.id, []).append(arc)
             for child in node.children:
+                child_angle = angle_for(child.id)
                 p1 = coords[child.id]
-                self._scene.addLine(p0.x(), p0.y(), p1.x(), p1.y(), pen)
+                p0 = point_at(child_angle, r0)
+                radial_pen = QPen(QColor(self._annotation_state.branch_colors.get(child.id, options.branch_color)))
+                radial_pen.setWidthF(options.branch_width)
+                radial = self._scene.addLine(p0.x(), p0.y(), p1.x(), p1.y(), radial_pen)
+                self._edge_visible_items.setdefault(child.id, []).append(radial)
                 hit = QGraphicsLineItem(p0.x(), p0.y(), p1.x(), p1.y())
                 hit.setPen(QPen(QColor(0, 0, 0, 0), 10.0))
                 hit.setData(0, child.id)
@@ -762,28 +1141,47 @@ class TreeView(QGraphicsView):
             if node.collapsed:
                 self._draw_collapsed_triangle_circular(node.id, pt)
             if options.show_tip_labels and (node.is_leaf() or node.collapsed):
-                self._draw_tip_label_circular(node, pt, angle_for(node.id), outer_radius)
+                self._draw_tip_label_circular(node, pt, angle_for(node.id), outer_radius, center)
+        self._draw_group_backgrounds_circular(context, center, inner_radius, outer_radius, angle_for, angle_step)
+        self._draw_groups_circular(context, center, outer_radius, angle_for, angle_step)
         self._draw_scale_bar(context, 40.0 + float(options.view_offset_x), float(options.canvas_height) - 30.0 + float(options.view_offset_y))
 
-    def _draw_tip_label_circular(self, node: TreeNode, pt: QPointF, angle: float, outer_radius: float) -> None:
+    def _draw_tip_label_circular(self, node: TreeNode, pt: QPointF, angle: float, outer_radius: float, center: QPointF) -> None:
         options = self._render_options
         display_text, font, color = self._resolve_tip_label(node)
         html_text = self._label_html_provider(node) if self._label_html_provider else self._plain_text_html(display_text)
         label = self._create_tip_label_item(node.id, display_text, html_text, font, color)
         label.setData(0, node.id)
         label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        offset = 18.0 if options.align_tip_labels else 10.0
-        lx = pt.x() + math.cos(angle) * offset
-        ly = pt.y() + math.sin(angle) * offset
-        if math.cos(angle) < 0:
-            lx -= label.boundingRect().width()
-        self._set_tip_label_pos(node.id, label, lx, ly - label.boundingRect().height() / 2)
+        align_labels = bool(options.align_tip_labels)
+        anchor_radius = outer_radius + (28.0 if align_labels else 12.0)
+        anchor = QPointF(center.x() + math.cos(angle) * anchor_radius, center.y() + math.sin(angle) * anchor_radius) if align_labels else QPointF(pt.x() + math.cos(angle) * 10.0, pt.y() + math.sin(angle) * 10.0)
+        width = label.boundingRect().width()
+        height = label.boundingRect().height()
+        if options.circular_label_follow_branch:
+            deg = math.degrees(angle)
+            right_side = math.cos(angle) >= 0
+            rotation = deg if right_side else deg + 180.0
+            if right_side:
+                label.setTransformOriginPoint(0.0, height / 2.0)
+                self._set_tip_label_pos(node.id, label, anchor.x(), anchor.y() - height / 2.0)
+            else:
+                label.setTransformOriginPoint(width, height / 2.0)
+                self._set_tip_label_pos(node.id, label, anchor.x() - width, anchor.y() - height / 2.0)
+            label.setRotation(rotation)
+        else:
+            label.setRotation(0.0)
+            label.setTransformOriginPoint(0.0, 0.0)
+            lx = anchor.x()
+            ly = anchor.y()
+            if math.cos(angle) < 0:
+                lx -= width
+            self._set_tip_label_pos(node.id, label, lx, ly - height / 2)
         self._scene.addItem(label)
         self._label_items[node.id] = label
-        if options.align_tip_labels and options.show_leader_lines:
-            target_r = outer_radius + 14.0
-            tx = float(options.canvas_width) / 2.0 + float(options.view_offset_x) + math.cos(angle) * target_r
-            ty = float(options.canvas_height) / 2.0 + float(options.view_offset_y) + math.sin(angle) * target_r
+        if align_labels and options.show_leader_lines:
+            tx = anchor.x()
+            ty = anchor.y()
             pen = QPen(QColor(options.leader_line_color))
             pen.setWidthF(options.leader_line_width)
             pen.setStyle(Qt.PenStyle.DashLine)
@@ -857,6 +1255,12 @@ class TreeView(QGraphicsView):
             self._scale_bar_label_item.setDefaultTextColor(self._scale_bar_color or QColor("#111827"))
             if self._scale_bar_font is not None:
                 self._scale_bar_label_item.document().setDefaultFont(self._scale_bar_font)
+        for group_id, item in self._group_label_items.items():
+            item.setHtml(self._group_html.get(group_id, item.toPlainText()))
+            item.setDefaultTextColor(self._group_color.get(group_id, QColor("#374151")))
+            font = self._group_font.get(group_id)
+            if font is not None:
+                item.document().setDefaultFont(font)
 
     def highlight_labels_contains(self, query: str) -> int:
         q = (query or "").strip().lower()
@@ -1076,6 +1480,13 @@ class TreeView(QGraphicsView):
             return
         self.scaleBarMoved.emit(x - anchor.x(), y - anchor.y())
 
+    def _emit_group_moved(self, group_id: str, x: float, y: float) -> None:
+        anchor = self._group_anchor_pos.get(group_id)
+        if anchor is None:
+            self.groupMoved.emit(group_id, x, y)
+            return
+        self.groupMoved.emit(group_id, x - anchor.x(), y - anchor.y())
+
     def _refresh_node_circle_visibility(self) -> None:
         show_all = self._render_options.show_node_circles
         show_selected = self._render_options.show_selected_node_circle
@@ -1101,12 +1512,13 @@ class TreeView(QGraphicsView):
                     pen.setColor(QColor("#2563eb"))
                     pen.setWidthF(max(2.0, pen.widthF()))
                 else:
-                    if pen.color().alpha() == 0:
-                        pen.setColor(QColor(0, 0, 0, 0))
-                        pen.setWidthF(10.0)
-                    else:
-                        pen.setColor(Qt.GlobalColor.black)
-                        pen.setWidthF(1.2)
+                    pen.setColor(QColor(0, 0, 0, 0))
+                    pen.setWidthF(10.0)
+                edge.setPen(pen)
+        for node_id, items in self._edge_visible_items.items():
+            for edge in items:
+                pen = edge.pen()
+                pen.setWidthF(max(2.0, float(self._render_options.branch_width)) if node_id in selected_ids else float(self._render_options.branch_width))
                 edge.setPen(pen)
         if self._scale_bar_item is not None:
             if SCALE_BAR_ID in selected_ids:
@@ -1128,12 +1540,13 @@ class TreeView(QGraphicsView):
         rect = self._export_rect()
         gen = QSvgGenerator()
         gen.setFileName(path)
-        gen.setSize(rect.size().toSize())
-        gen.setViewBox(rect)
+        export_rect = QRectF(0.0, 0.0, rect.width(), rect.height())
+        gen.setSize(export_rect.size().toSize())
+        gen.setViewBox(export_rect)
         gen.setTitle("PhyloTree Viewer Export")
         painter = QPainter(gen)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
-        self._scene.render(painter, target=rect, source=rect)
+        self._scene.render(painter, target=export_rect, source=rect)
         painter.end()
 
     def export_png(self, path: str, scale: float = 2.0) -> None:
@@ -1145,7 +1558,8 @@ class TreeView(QGraphicsView):
         painter = QPainter(img)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
         painter.scale(scale, scale)
-        self._scene.render(painter, target=rect, source=rect)
+        target = QRectF(0.0, 0.0, rect.width(), rect.height())
+        self._scene.render(painter, target=target, source=rect)
         painter.end()
         if not img.save(path):
             raise ValueError("PNG 保存失败")
@@ -1155,12 +1569,13 @@ class TreeView(QGraphicsView):
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(path)
+        printer.setPageSize(QPageSize(QSizeF(max(1.0, rect.width()), max(1.0, rect.height())), QPageSize.Unit.Point, "PhyloTreeContent"))
         printer.setFullPage(True)
         painter = QPainter(printer)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
-        scale = min(printer.pageRect(QPrinter.Unit.Point).width() / rect.width(), printer.pageRect(QPrinter.Unit.Point).height() / rect.height())
-        painter.scale(scale, scale)
-        self._scene.render(painter, target=rect, source=rect)
+        page = printer.pageRect(QPrinter.Unit.DevicePixel)
+        target = QRectF(0.0, 0.0, page.width(), page.height())
+        self._scene.render(painter, target=target, source=rect)
         painter.end()
 
     def set_message(self, text: str) -> None:

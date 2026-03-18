@@ -50,6 +50,16 @@ from app.phylo.parse import load_trees
 from app.phylo.style_config import LabelSpanRule, LabelStyle, TreeStyles, label_to_html, load_and_apply_config
 
 
+BASIC_COLOR_SEQUENCE = [
+    "#000000", "#8B0000", "#006400", "#A35C00", "#0F9D0F", "#9AA300", "#25D425", "#7ED321",
+    "#0D1B8C", "#9C0A8C", "#0B4F6C", "#B565A7", "#0E9F8A", "#B3B39D", "#19D88B", "#A8F28A",
+    "#1537D1", "#8A2BE2", "#2457FF", "#C07BFF", "#2F8BFF", "#9AA9FF", "#48D6FF", "#7FE7E7",
+    "#204A87", "#FF1493", "#5B5F97", "#FF5A7A", "#5DA271", "#FFB07C", "#68E07A", "#F3F08D",
+    "#4B0082", "#E600E6", "#5A54D6", "#E056FD", "#5DA9E9", "#E0A3F5", "#76E3EA", "#F4F4F4",
+    "#1E90FF", "#FFD700", "#7CFC00", "#FFFF00", "#FF8C00", "#FF4500", "#ADFF2F", "#32CD32",
+]
+
+
 @dataclass
 class HistoryState:
     model: TreeModel
@@ -81,9 +91,9 @@ class TipStyleDialog(QDialog):
         layout.addLayout(form)
 
         fmt_row = QHBoxLayout()
-        self._fmt_font = QFontComboBox(self)
+        self._fmt_font = NoWheelFontComboBox(self)
         self._fmt_font.currentFontChanged.connect(self._apply_selected_font_family)
-        self._fmt_size = QSpinBox(self)
+        self._fmt_size = NoWheelSpinBox(self)
         self._fmt_size.setRange(6, 96)
         self._fmt_size.setValue(max(6, int(default_font.pointSizeF()) if default_font.pointSizeF() > 0 else 11))
         self._fmt_size.valueChanged.connect(self._apply_selected_font_size)
@@ -174,30 +184,47 @@ class TipStyleDialog(QDialog):
         return plain_text, rich_html
 
 class GroupDialog(QDialog):
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, background_only: bool = False, initial_color: str | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("新增分组")
+        self._background_only = background_only
+        self.setWindowTitle("新增底色" if background_only else "新增分组")
+        self.setMinimumWidth(360)
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self._name_edit = QLineEdit(self)
-        form.addRow("分组名称", self._name_edit)
-        self._line_color_btn = QPushButton("选择分组颜色", self)
-        self._line_color = QColor("#374151")
-        self._line_color_btn.clicked.connect(self._choose_line_color)
-        form.addRow("分组颜色", self._line_color_btn)
-        self._bg_enabled = QCheckBox("增加标签底色", self)
-        form.addRow(self._bg_enabled)
-        self._bg_scope = QComboBox(self)
+        self._name_edit: QLineEdit | None = None
+        initial_qcolor = QColor(initial_color) if initial_color else QColor("#374151")
+        self._line_color = QColor(initial_qcolor)
+        self._bg_start = QColor(initial_qcolor)
+        self._bg_end = QColor(initial_qcolor)
+        self._bg_start_custom = False
+        self._bg_end_custom = False
+        if not background_only:
+            self._name_edit = QLineEdit(self)
+            form.addRow("分组名称", self._name_edit)
+            self._line_color_btn = QPushButton("选择分组颜色", self)
+            self._line_color_btn.clicked.connect(self._choose_line_color)
+            form.addRow("分组颜色", self._line_color_btn)
+            self._bg_enabled = QCheckBox("增加标签底色", self)
+            self._bg_enabled.setChecked(True)
+            self._bg_enabled.toggled.connect(self._sync_background_controls)
+            form.addRow(self._bg_enabled)
+        else:
+            self._line_color_btn = None
+            self._bg_enabled = None
+        self._bg_scope = NoWheelComboBox(self)
         self._bg_scope.addItems(["label", "full"])
+        if not background_only:
+            self._bg_scope.setCurrentText("full")
         form.addRow("底色范围", self._bg_scope)
         self._gradient_enabled = QCheckBox("使用渐变", self)
+        if not background_only:
+            self._gradient_enabled.setChecked(True)
+        self._gradient_enabled.toggled.connect(self._on_gradient_toggled)
         form.addRow(self._gradient_enabled)
         self._bg_start_btn = QPushButton("底色起点颜色", self)
-        self._bg_start = QColor("#bfdbfe")
         self._bg_start_btn.clicked.connect(self._choose_bg_start)
         form.addRow("起点颜色", self._bg_start_btn)
         self._bg_end_btn = QPushButton("底色终点颜色", self)
-        self._bg_end = QColor("#93c5fd")
         self._bg_end_btn.clicked.connect(self._choose_bg_end)
         form.addRow("终点颜色", self._bg_end_btn)
         layout.addLayout(form)
@@ -205,30 +232,86 @@ class GroupDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._sync_group_background_defaults(force=True)
+        self._refresh_color_buttons()
+        self._sync_background_controls()
 
     def _choose_line_color(self) -> None:
         color = QColorDialog.getColor(self._line_color, self, "选择分组颜色")
         if color.isValid():
             self._line_color = color
+            self._sync_group_background_defaults()
+            self._refresh_color_buttons()
 
     def _choose_bg_start(self) -> None:
         color = QColorDialog.getColor(self._bg_start, self, "选择底色起点颜色")
         if color.isValid():
             self._bg_start = color
+            self._bg_start_custom = True
+            self._refresh_color_buttons()
 
     def _choose_bg_end(self) -> None:
         color = QColorDialog.getColor(self._bg_end, self, "选择底色终点颜色")
         if color.isValid():
             self._bg_end = color
+            self._bg_end_custom = True
+            self._refresh_color_buttons()
+
+    def _button_style_for_color(self, color: QColor) -> str:
+        text_color = "#111827" if color.lightnessF() > 0.6 else "#f9fafb"
+        return f"background-color:{color.name()}; color:{text_color};"
+
+    def _refresh_color_buttons(self) -> None:
+        if self._line_color_btn is not None:
+            self._line_color_btn.setText(self._line_color.name())
+            self._line_color_btn.setStyleSheet(self._button_style_for_color(self._line_color))
+        self._bg_start_btn.setText(self._bg_start.name())
+        self._bg_start_btn.setStyleSheet(self._button_style_for_color(self._bg_start))
+        self._bg_end_btn.setText(self._bg_end.name())
+        self._bg_end_btn.setStyleSheet(self._button_style_for_color(self._bg_end))
+
+    def _sync_group_background_defaults(self, force: bool = False) -> None:
+        if self._background_only:
+            return
+        if force or not self._bg_start_custom:
+            self._bg_start = QColor("#ffffff") if self._gradient_enabled.isChecked() else QColor(self._line_color)
+        if force or not self._bg_end_custom:
+            self._bg_end = QColor(self._line_color)
+
+    def _sync_background_controls(self) -> None:
+        enabled = self._background_only or bool(self._bg_enabled and self._bg_enabled.isChecked())
+        self._bg_scope.setEnabled(enabled)
+        self._gradient_enabled.setEnabled(enabled)
+        self._bg_start_btn.setEnabled(enabled)
+        self._bg_end_btn.setEnabled(enabled and self._gradient_enabled.isChecked())
+
+    def _on_gradient_toggled(self, checked: bool) -> None:
+        if not self._background_only and not self._bg_start_custom:
+            self._bg_start = QColor("#ffffff") if checked else QColor(self._line_color)
+        if not self._background_only and not self._bg_end_custom:
+            self._bg_end = QColor(self._line_color)
+        self._refresh_color_buttons()
+        self._sync_background_controls()
 
     def values(self) -> dict:
+        if self._background_only:
+            background_color_start = self._bg_start.name()
+            background_color_end = self._bg_end.name() if self._gradient_enabled.isChecked() else None
+        else:
+            if self._gradient_enabled.isChecked():
+                background_color_start = self._bg_start.name() if self._bg_start_custom else "#ffffff"
+                background_color_end = self._bg_end.name() if self._bg_end_custom else self._line_color.name()
+            else:
+                background_color_start = self._bg_start.name() if self._bg_start_custom else self._line_color.name()
+                background_color_end = None
         return {
-            "name": self._name_edit.text().strip(),
+            "name": self._name_edit.text().strip() if self._name_edit is not None else "",
             "color": self._line_color.name(),
-            "background_enabled": self._bg_enabled.isChecked(),
+            "background_enabled": True if self._background_only else bool(self._bg_enabled and self._bg_enabled.isChecked()),
             "background_scope": self._bg_scope.currentText(),
-            "background_color_start": self._bg_start.name(),
-            "background_color_end": self._bg_end.name() if self._gradient_enabled.isChecked() else None,
+            "background_color_start": background_color_start,
+            "background_color_end": background_color_end,
+            "show_marker": not self._background_only,
         }
 
 
@@ -255,7 +338,71 @@ class BatchReplaceDialog(QDialog):
         return self._pattern_edit.text(), self._repl_edit.text(), flags
 
 
-class TrimmedDoubleSpinBox(QDoubleSpinBox):
+class FocusWheelMixin:
+    def wheelEvent(self, event) -> None:
+        if self.hasFocus():
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
+class NoWheelComboBox(FocusWheelMixin, QComboBox):
+    pass
+
+
+class NoWheelFontComboBox(FocusWheelMixin, QFontComboBox):
+    pass
+
+
+class NoWheelSpinBox(FocusWheelMixin, QSpinBox):
+    pass
+
+
+class NoWheelDoubleSpinBox(FocusWheelMixin, QDoubleSpinBox):
+    pass
+
+
+class ExportBundleDialog(QDialog):
+    def __init__(self, initial_directory: str, initial_prefix: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("一键导出")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self._directory_edit = QLineEdit(initial_directory, self)
+        self._prefix_edit = QLineEdit(initial_prefix, self)
+
+        browse_row = QWidget(self)
+        browse_layout = QHBoxLayout(browse_row)
+        browse_layout.setContentsMargins(0, 0, 0, 0)
+        browse_layout.setSpacing(8)
+        browse_layout.addWidget(self._directory_edit)
+        browse_button = QPushButton("浏览...", self)
+        browse_button.clicked.connect(self._browse_directory)
+        browse_layout.addWidget(browse_button)
+
+        form.addRow("输出目录", browse_row)
+        form.addRow("文件前缀", self._prefix_edit)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse_directory(self) -> None:
+        base_dir = self._directory_edit.text().strip() or str(Path.home())
+        directory = QFileDialog.getExistingDirectory(self, "选择输出目录", base_dir)
+        if directory:
+            self._directory_edit.setText(directory)
+
+    def values(self) -> tuple[str, str]:
+        return self._directory_edit.text().strip(), self._prefix_edit.text().strip()
+
+
+class TrimmedDoubleSpinBox(NoWheelDoubleSpinBox):
     def textFromValue(self, value: float) -> str:
         text = f"{value:.6f}".rstrip("0").rstrip(".")
         return text if text else "0"
@@ -347,6 +494,8 @@ class MainWindow(QMainWindow):
         self._viewer.tipLabelEdited.connect(self._on_tip_label_edited)
         self._viewer.scaleBarMoved.connect(self._on_scale_bar_moved)
         self._viewer.scaleBarEdited.connect(self._on_scale_bar_edited)
+        self._viewer.groupMoved.connect(self._on_group_moved)
+        self._viewer.groupEdited.connect(self._on_group_edited)
         self._sync_controls_from_options()
         self._sync_node_label_controls()
         self._sync_scale_bar_controls()
@@ -363,9 +512,9 @@ class MainWindow(QMainWindow):
         reload_action.triggered.connect(self._reload_current)
         file_menu.addAction(reload_action)
         file_menu.addSeparator()
-        export_svg_action = QAction("导出 SVG...", self)
-        export_svg_action.triggered.connect(self._export_svg)
-        file_menu.addAction(export_svg_action)
+        export_bundle_action = QAction("一键导出...", self)
+        export_bundle_action.triggered.connect(self._export_bundle)
+        file_menu.addAction(export_bundle_action)
         export_png_action = QAction("导出 PNG...", self)
         export_png_action.triggered.connect(self._export_png)
         file_menu.addAction(export_png_action)
@@ -443,8 +592,8 @@ class MainWindow(QMainWindow):
         act_search = QAction("搜索", self)
         act_search.triggered.connect(self._search_taxa)
         tb.addAction(act_search)
-        act_export = QAction("导出 PNG", self)
-        act_export.triggered.connect(self._export_png)
+        act_export = QAction("一键导出", self)
+        act_export.triggered.connect(self._export_bundle)
         tb.addAction(act_export)
 
     def _build_ui(self) -> None:
@@ -483,7 +632,7 @@ class MainWindow(QMainWindow):
     def _build_layout_page(self) -> QWidget:
         page = QWidget(self)
         layout = QFormLayout(page)
-        self._cmb_layout = QComboBox(self)
+        self._cmb_layout = NoWheelComboBox(self)
         self._cmb_layout.addItems(["rectangular", "circular"])
         self._cmb_layout.currentTextChanged.connect(self._on_layout_changed)
         layout.addRow("布局模式", self._cmb_layout)
@@ -493,16 +642,31 @@ class MainWindow(QMainWindow):
         self._chk_align_labels = QCheckBox("样品名称右侧对齐", self)
         self._chk_align_labels.toggled.connect(self._on_align_labels_changed)
         layout.addRow(self._chk_align_labels)
+        self._circular_start_angle_spin = NoWheelDoubleSpinBox(self)
+        self._circular_start_angle_spin.setRange(-360.0, 360.0)
+        self._circular_start_angle_spin.setSingleStep(5.0)
+        self._circular_start_angle_spin.setSuffix("°")
+        self._circular_start_angle_spin.valueChanged.connect(self._on_circular_start_angle_changed)
+        layout.addRow("环形起始角度", self._circular_start_angle_spin)
+        self._circular_gap_spin = NoWheelDoubleSpinBox(self)
+        self._circular_gap_spin.setRange(0.0, 300.0)
+        self._circular_gap_spin.setSingleStep(1.0)
+        self._circular_gap_spin.setSuffix("°")
+        self._circular_gap_spin.valueChanged.connect(self._on_circular_gap_changed)
+        layout.addRow("环形留缝角度", self._circular_gap_spin)
+        self._chk_circular_follow_branch = QCheckBox("环形文字跟随分支方向", self)
+        self._chk_circular_follow_branch.toggled.connect(self._on_circular_follow_branch_changed)
+        layout.addRow(self._chk_circular_follow_branch)
         self._width_slider, self._width_spin = self._make_slider_spin(400, 3200, self._on_width_changed)
         layout.addRow("宽度", self._wrap_slider_spin(self._width_slider, self._width_spin))
         self._height_slider, self._height_spin = self._make_slider_spin(280, 2400, self._on_height_changed)
         layout.addRow("高度", self._wrap_slider_spin(self._height_slider, self._height_spin))
-        self._view_offset_x_spin = QDoubleSpinBox(self)
+        self._view_offset_x_spin = NoWheelDoubleSpinBox(self)
         self._view_offset_x_spin.setRange(-2000.0, 2000.0)
         self._view_offset_x_spin.setSingleStep(5.0)
         self._view_offset_x_spin.valueChanged.connect(self._on_view_offset_x_changed)
         layout.addRow("整体 X 偏移", self._view_offset_x_spin)
-        self._view_offset_y_spin = QDoubleSpinBox(self)
+        self._view_offset_y_spin = NoWheelDoubleSpinBox(self)
         self._view_offset_y_spin.setRange(-2000.0, 2000.0)
         self._view_offset_y_spin.setSingleStep(5.0)
         self._view_offset_y_spin.valueChanged.connect(self._on_view_offset_y_changed)
@@ -543,25 +707,28 @@ class MainWindow(QMainWindow):
         self._chk_show_leader_lines = QCheckBox("显示末端虚线", self)
         self._chk_show_leader_lines.toggled.connect(self._on_show_leader_lines_changed)
         layout.addRow(self._chk_show_leader_lines)
-        self._font_combo = QFontComboBox(self)
+        self._font_combo = NoWheelFontComboBox(self)
         self._font_combo.currentFontChanged.connect(self._on_global_font_changed)
         layout.addRow("全局字体", self._font_combo)
-        self._font_size_spin = QSpinBox(self)
+        self._font_size_spin = NoWheelSpinBox(self)
         self._font_size_spin.setRange(6, 48)
         self._font_size_spin.valueChanged.connect(self._on_global_font_size_changed)
         layout.addRow("字体大小", self._font_size_spin)
         self._btn_leader_color = QPushButton("设置虚线颜色", self)
         self._btn_leader_color.clicked.connect(self._choose_leader_line_color)
         layout.addRow(self._btn_leader_color)
-        self._leader_width_spin = QDoubleSpinBox(self)
+        self._leader_width_spin = NoWheelDoubleSpinBox(self)
         self._leader_width_spin.setRange(0.1, 10.0)
         self._leader_width_spin.setSingleStep(0.1)
         self._leader_width_spin.valueChanged.connect(self._on_leader_width_changed)
         layout.addRow("虚线粗细", self._leader_width_spin)
-        self._btn_branch_color = QPushButton("设置分支颜色", self)
+        self._btn_branch_color = QPushButton("设置全部分支颜色", self)
         self._btn_branch_color.clicked.connect(self._choose_branch_color)
         layout.addRow(self._btn_branch_color)
-        self._branch_width_spin = QDoubleSpinBox(self)
+        self._btn_selected_branch_color = QPushButton("设置选中分支颜色", self)
+        self._btn_selected_branch_color.clicked.connect(self._choose_selected_branch_color)
+        layout.addRow(self._btn_selected_branch_color)
+        self._branch_width_spin = NoWheelDoubleSpinBox(self)
         self._branch_width_spin.setRange(0.1, 10.0)
         self._branch_width_spin.setSingleStep(0.1)
         self._branch_width_spin.valueChanged.connect(self._on_branch_width_changed)
@@ -600,11 +767,11 @@ class MainWindow(QMainWindow):
         self._chk_show_support = QCheckBox("显示节点置信度", self)
         self._chk_show_support.toggled.connect(self._on_show_support_changed)
         layout.addRow(self._chk_show_support)
-        self._support_size_spin = QSpinBox(self)
+        self._support_size_spin = NoWheelSpinBox(self)
         self._support_size_spin.setRange(6, 32)
         self._support_size_spin.valueChanged.connect(self._on_support_size_changed)
         layout.addRow("置信度字号", self._support_size_spin)
-        self._node_circle_size_spin = QDoubleSpinBox(self)
+        self._node_circle_size_spin = NoWheelDoubleSpinBox(self)
         self._node_circle_size_spin.setRange(2.0, 32.0)
         self._node_circle_size_spin.setSingleStep(0.2)
         self._node_circle_size_spin.valueChanged.connect(self._on_node_circle_size_changed)
@@ -612,12 +779,12 @@ class MainWindow(QMainWindow):
         self._btn_node_circle_color = QPushButton("设置圆圈颜色", self)
         self._btn_node_circle_color.clicked.connect(self._choose_node_circle_color)
         layout.addRow(self._btn_node_circle_color)
-        self._node_offset_x_spin = QDoubleSpinBox(self)
+        self._node_offset_x_spin = NoWheelDoubleSpinBox(self)
         self._node_offset_x_spin.setRange(-500.0, 500.0)
         self._node_offset_x_spin.setSingleStep(1.0)
         self._node_offset_x_spin.valueChanged.connect(self._on_node_offset_x_changed)
         layout.addRow("置信度全局 X 偏移", self._node_offset_x_spin)
-        self._node_offset_y_spin = QDoubleSpinBox(self)
+        self._node_offset_y_spin = NoWheelDoubleSpinBox(self)
         self._node_offset_y_spin.setRange(-500.0, 500.0)
         self._node_offset_y_spin.setSingleStep(1.0)
         self._node_offset_y_spin.valueChanged.connect(self._on_node_offset_y_changed)
@@ -641,12 +808,23 @@ class MainWindow(QMainWindow):
         btn_group = QPushButton("将选中样品新增为分组", self)
         btn_group.clicked.connect(self._create_group_from_selection)
         layout.addWidget(btn_group)
+        btn_group_bg = QPushButton("将选中样品新增底色", self)
+        btn_group_bg.clicked.connect(self._create_background_from_selection)
+        layout.addWidget(btn_group_bg)
         btn_group_parent = QPushButton("将选中分组合并为上级分组", self)
         btn_group_parent.clicked.connect(self._create_group_from_selected_groups)
         layout.addWidget(btn_group_parent)
         btn_highlight = QPushButton("为选中节点设置子树底色", self)
         btn_highlight.clicked.connect(self._set_selected_clade_highlight)
         layout.addWidget(btn_highlight)
+        width_row = QHBoxLayout()
+        width_row.addWidget(QLabel("分组竖线宽度", self))
+        self._group_line_width_spin = NoWheelDoubleSpinBox(self)
+        self._group_line_width_spin.setRange(1.0, 12.0)
+        self._group_line_width_spin.setSingleStep(0.2)
+        self._group_line_width_spin.valueChanged.connect(self._on_group_line_width_changed)
+        width_row.addWidget(self._group_line_width_spin)
+        layout.addLayout(width_row)
         self._group_list = QListWidget(self)
         self._group_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         layout.addWidget(self._group_list)
@@ -680,16 +858,16 @@ class MainWindow(QMainWindow):
         self._scale_length_spin.setSingleStep(0.01)
         self._scale_length_spin.valueChanged.connect(self._on_scale_length_changed)
         layout.addRow("手动长度", self._scale_length_spin)
-        self._cmb_scale_pos = QComboBox(self)
+        self._cmb_scale_pos = NoWheelComboBox(self)
         self._cmb_scale_pos.addItems(["left", "right"])
         self._cmb_scale_pos.currentTextChanged.connect(self._on_scale_position_changed)
         layout.addRow("位置", self._cmb_scale_pos)
-        self._scale_offset_x_spin = QDoubleSpinBox(self)
+        self._scale_offset_x_spin = NoWheelDoubleSpinBox(self)
         self._scale_offset_x_spin.setRange(-1000.0, 1000.0)
         self._scale_offset_x_spin.setSingleStep(1.0)
         self._scale_offset_x_spin.valueChanged.connect(self._on_scale_offset_x_changed)
         layout.addRow("X 偏移", self._scale_offset_x_spin)
-        self._scale_offset_y_spin = QDoubleSpinBox(self)
+        self._scale_offset_y_spin = NoWheelDoubleSpinBox(self)
         self._scale_offset_y_spin.setRange(-1000.0, 1000.0)
         self._scale_offset_y_spin.setSingleStep(1.0)
         self._scale_offset_y_spin.valueChanged.connect(self._on_scale_offset_y_changed)
@@ -717,7 +895,7 @@ class MainWindow(QMainWindow):
         slider.valueChanged.connect(callback)
         slider.sliderPressed.connect(self._begin_view_drag)
         slider.sliderReleased.connect(self._end_view_drag)
-        spin = QSpinBox(self)
+        spin = NoWheelSpinBox(self)
         spin.setRange(minimum, maximum)
         spin.setSingleStep(10)
         spin.setSuffix(" px")
@@ -741,6 +919,9 @@ class MainWindow(QMainWindow):
         self._cmb_layout.setCurrentText(options.layout_mode)
         self._chk_ignore_lengths.setChecked(options.ignore_branch_lengths)
         self._chk_align_labels.setChecked(options.align_tip_labels)
+        self._circular_start_angle_spin.setValue(float(options.circular_start_angle))
+        self._circular_gap_spin.setValue(float(options.circular_gap_degrees))
+        self._chk_circular_follow_branch.setChecked(bool(options.circular_label_follow_branch))
         self._chk_show_tip_labels.setChecked(options.show_tip_labels)
         self._chk_show_node_circles.setChecked(options.show_node_circles)
         self._chk_show_selected_node_circle.setChecked(options.show_selected_node_circle)
@@ -752,6 +933,7 @@ class MainWindow(QMainWindow):
         self._node_circle_size_spin.setValue(options.node_circle_size)
         self._node_offset_x_spin.setValue(options.support_offset_x)
         self._node_offset_y_spin.setValue(options.support_offset_y)
+        self._group_line_width_spin.setValue(float(options.group_line_width))
         self._leader_width_spin.setValue(options.leader_line_width)
         self._branch_width_spin.setValue(options.branch_width)
         self._width_slider.setValue(options.canvas_width)
@@ -776,10 +958,23 @@ class MainWindow(QMainWindow):
             display_text = override.display_text if override and override.display_text is not None else label
             html_text = html.escape(display_text).replace("\n", "<br/>")
             if styles is not None:
-                base = styles.label_style_by_taxon.get(label)
-                spans = styles.label_spans_by_taxon.get(label) or []
+                lookup_keys = [label]
+                if node.original_name and node.original_name not in lookup_keys:
+                    lookup_keys.append(node.original_name)
+                style_key = next(
+                    (
+                        key
+                        for key in lookup_keys
+                        if key in styles.label_style_by_taxon
+                        or key in styles.label_spans_by_taxon
+                        or key in styles.annotations_by_taxon
+                    ),
+                    label,
+                )
+                base = styles.label_style_by_taxon.get(style_key)
+                spans = styles.label_spans_by_taxon.get(style_key) or []
                 html_text = label_to_html(label, base, spans)
-                ann = styles.annotations_by_taxon.get(label)
+                ann = styles.annotations_by_taxon.get(style_key)
                 if ann:
                     html_text = f'{html_text} <span style="color:#6b7280">{html.escape(ann)}</span>'
                 if display_text != label:
@@ -804,6 +999,39 @@ class MainWindow(QMainWindow):
             return html_text
 
         return provider
+
+    def _matching_config_keys(self, node: TreeNode) -> list[str]:
+        keys: list[str] = []
+        if node.name:
+            keys.append(node.name)
+        if node.original_name and node.original_name not in keys:
+            keys.append(node.original_name)
+        return keys
+
+    def _summarize_config_application(self, before_leaf_names: dict[str, str], styles: TreeStyles) -> dict[str, int]:
+        summary = {
+            "renamed": 0,
+            "label_styles": 0,
+            "label_spans": 0,
+            "annotations": 0,
+        }
+        if self._model is None:
+            return summary
+        for node in self._model.iter_nodes():
+            if not node.is_leaf():
+                continue
+            before_name = before_leaf_names.get(node.id, "")
+            after_name = node.name or ""
+            if before_name != after_name:
+                summary["renamed"] += 1
+            keys = self._matching_config_keys(node)
+            if any(key in styles.label_style_by_taxon for key in keys):
+                summary["label_styles"] += 1
+            if any(key in styles.label_spans_by_taxon for key in keys):
+                summary["label_spans"] += 1
+            if any(key in styles.annotations_by_taxon for key in keys):
+                summary["annotations"] += 1
+        return summary
 
     def _apply_state_to_viewer(self) -> None:
         self._viewer.set_annotation_state(self._annotations)
@@ -978,7 +1206,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已重做上一步操作。", 4000)
 
     def _set_actions_enabled(self, enabled: bool) -> None:
-        for widget in [self._btn_reroot, self._btn_rotate, self._btn_collapse, self._btn_sort_tree, self._btn_auto_adjust, self._btn_search, self._btn_batch, self._btn_import_config]:
+        for widget in [self._btn_reroot, self._btn_rotate, self._btn_collapse, self._btn_sort_tree, self._btn_auto_adjust, self._btn_search, self._btn_batch, self._btn_import_config, self._btn_selected_branch_color]:
             widget.setEnabled(enabled)
 
     def _on_node_clicked(self, node_id: str) -> None:
@@ -1092,6 +1320,29 @@ class MainWindow(QMainWindow):
             )
         self._rerender_current_tree()
 
+    def _on_group_moved(self, group_id: str, x: float, y: float) -> None:
+        group = next((g for g in self._annotations.leaf_groups if g.group_id == group_id), None)
+        if group is None:
+            return
+        before = self._capture_history_state()
+        group.offset = (x, y)
+        self._push_undo_state(before)
+        self._refresh_group_list()
+
+    def _on_group_edited(self, group_id: str, plain_text: str, rich_html: str) -> None:
+        group = next((g for g in self._annotations.leaf_groups if g.group_id == group_id), None)
+        if group is None:
+            return
+        normalized_rich = self._normalized_rich_html(rich_html, plain_text)
+        current_rich = group.rich_html
+        if group.name == plain_text and current_rich == normalized_rich:
+            return
+        before = self._capture_history_state()
+        group.name = plain_text
+        group.rich_html = normalized_rich
+        self._push_undo_state(before)
+        self._rerender_current_tree()
+
     def _edit_scale_bar_text(self) -> None:
         if not self._model:
             return
@@ -1154,6 +1405,8 @@ class MainWindow(QMainWindow):
     def _show_context_menu(self, kind: str, object_id: str, pos) -> None:
         if self._model is None:
             return
+        if object_id:
+            self._selected_node_id = object_id
         if kind == "support":
             kind = "node"
         if kind == "canvas" and self._selected_node_id:
@@ -1178,7 +1431,8 @@ class MainWindow(QMainWindow):
             menu.addAction("还原默认节点标签", self._reset_selected_node_label_text)
         if kind == "tip":
             menu.addAction("编辑样品文本", self._edit_selected_tip_font)
-            if len(self._selected_tip_names()) >= 2:
+            menu.addAction("新增底色", self._create_background_from_selection)
+            if len(self._selected_tip_names()) >= 1 or bool(object_id):
                 menu.addAction("新增分组", self._create_group_from_selection)
         if kind == "group":
             menu.addAction("重命名分组", lambda: self._rename_group(object_id))
@@ -1249,10 +1503,13 @@ class MainWindow(QMainWindow):
             "node_label_overrides": {k: asdict(v) for k, v in self._annotations.node_label_overrides.items()},
             "scale_bar_label_override": asdict(self._annotations.scale_bar_label_override) if self._annotations.scale_bar_label_override else None,
             "clade_highlights": {k: asdict(v) for k, v in self._annotations.clade_highlights.items()},
+            "branch_colors": self._annotations.branch_colors,
             "leaf_groups": [asdict(group) for group in self._annotations.leaf_groups],
             "node_label_offsets": self._annotations.node_label_offsets,
             "tip_label_offsets": self._annotations.tip_label_offsets,
             "scale_bar_offset": self._annotations.scale_bar_offset,
+            "preserve_root_order": self._annotations.preserve_root_order,
+            "next_group_color_index": self._annotations.next_group_color_index,
         }
 
     def _serialize_styles(self) -> dict | None:
@@ -1310,10 +1567,13 @@ class MainWindow(QMainWindow):
             node_label_overrides={k: NodeLabelOverride(**v) for k, v in (data.get("node_label_overrides") or {}).items()},
             scale_bar_label_override=ScaleBarLabelOverride(**data["scale_bar_label_override"]) if data.get("scale_bar_label_override") else None,
             clade_highlights={k: CladeHighlight(**v) for k, v in (data.get("clade_highlights") or {}).items()},
+            branch_colors={str(k): str(v) for k, v in (data.get("branch_colors") or {}).items()},
             leaf_groups=[LeafGroupAnnotation(**group) for group in (data.get("leaf_groups") or [])],
             node_label_offsets={k: tuple(v) for k, v in (data.get("node_label_offsets") or {}).items()},
             tip_label_offsets={k: tuple(v) for k, v in (data.get("tip_label_offsets") or {}).items()},
             scale_bar_offset=tuple(data["scale_bar_offset"]) if data.get("scale_bar_offset") is not None else None,
+            preserve_root_order=bool(data.get("preserve_root_order", False)),
+            next_group_color_index=int(data.get("next_group_color_index", 0)),
         )
 
     def _html_to_plain_text(self, rich_html: str) -> str:
@@ -1410,6 +1670,19 @@ class MainWindow(QMainWindow):
     def _on_align_labels_changed(self, checked: bool) -> None:
         self._mutate_view_options(lambda o: setattr(o, "align_tip_labels", checked))
 
+    def _on_circular_start_angle_changed(self, value: float) -> None:
+        if self._syncing_controls:
+            return
+        self._mutate_view_options(lambda o: setattr(o, "circular_start_angle", float(value)))
+
+    def _on_circular_gap_changed(self, value: float) -> None:
+        if self._syncing_controls:
+            return
+        self._mutate_view_options(lambda o: setattr(o, "circular_gap_degrees", float(value)))
+
+    def _on_circular_follow_branch_changed(self, checked: bool) -> None:
+        self._mutate_view_options(lambda o: setattr(o, "circular_label_follow_branch", checked))
+
     def _on_show_tip_labels_changed(self, checked: bool) -> None:
         self._mutate_view_options(lambda o: setattr(o, "show_tip_labels", checked))
 
@@ -1448,6 +1721,11 @@ class MainWindow(QMainWindow):
         if self._syncing_controls:
             return
         self._mutate_view_options(lambda o: setattr(o, "node_circle_size", float(value)))
+
+    def _on_group_line_width_changed(self, value: float) -> None:
+        if self._syncing_controls:
+            return
+        self._mutate_view_options(lambda o: setattr(o, "group_line_width", float(value)))
 
     def _reset_selected_node_label_offset(self) -> None:
         node = self._selected_support_node()
@@ -1560,8 +1838,25 @@ class MainWindow(QMainWindow):
 
     def _choose_branch_color(self) -> None:
         color = QColorDialog.getColor(QColor(self._current_options().branch_color), self, "选择分支颜色")
-        if color.isValid():
-            self._mutate_view_options(lambda o: setattr(o, "branch_color", color.name()))
+        if not color.isValid():
+            return
+        before = self._capture_history_state()
+        self._annotations.branch_colors.clear()
+        self._push_undo_state(before)
+        self._mutate_view_options(lambda o: setattr(o, "branch_color", color.name()))
+
+    def _choose_selected_branch_color(self) -> None:
+        if not self._model or not self._selected_node_id:
+            QMessageBox.information(self, "提示", "请先选中一个分支或对应节点。")
+            return
+        current_color = self._annotations.branch_colors.get(self._selected_node_id, self._current_options().branch_color)
+        color = QColorDialog.getColor(QColor(current_color), self, "选择选中分支颜色")
+        if not color.isValid():
+            return
+        before = self._capture_history_state()
+        self._annotations.branch_colors[self._selected_node_id] = color.name()
+        self._push_undo_state(before)
+        self._rerender_current_tree()
 
     def _choose_node_circle_color(self) -> None:
         color = QColorDialog.getColor(QColor(self._current_options().node_circle_color), self, "选择节点圆圈颜色")
@@ -1600,6 +1895,7 @@ class MainWindow(QMainWindow):
             other = root.children[0] if root.children[1].id == target.id else root.children[1]
             root.children = [target, other] if self._chk_reroot_on_top.isChecked() else [other, target]
             self._annotations.leaf_groups.clear()
+            self._annotations.preserve_root_order = True
             self._push_undo_state(before)
             self._rerender_current_tree()
             return
@@ -1632,6 +1928,7 @@ class MainWindow(QMainWindow):
         new_root.branch_length = None
         self._model.root = new_root
         self._annotations.leaf_groups.clear()
+        self._annotations.preserve_root_order = True
         self._rerender_current_tree()
 
     def _rotate_selected(self) -> None:
@@ -1666,13 +1963,16 @@ class MainWindow(QMainWindow):
             return False
         max_depth = self._max_visible_leaf_depth(self._model.root, 0)
         changed = False
+        preserve_root_order = bool(self._annotations.preserve_root_order)
 
-        def sort_node(node: TreeNode, depth: int) -> None:
+        def sort_node(node: TreeNode, depth: int, is_root: bool = False) -> None:
             nonlocal changed
             if node.is_leaf() or node.collapsed or len(node.children) < 2:
                 return
             for child in node.children:
-                sort_node(child, depth + 1)
+                sort_node(child, depth + 1, False)
+            if is_root and preserve_root_order:
+                return
 
             def child_key(child: TreeNode) -> tuple[int, float, str]:
                 display_depth = max_depth if child.is_leaf() or child.collapsed else depth + 1
@@ -1687,7 +1987,7 @@ class MainWindow(QMainWindow):
             if old_order != [child.id for child in node.children]:
                 changed = True
 
-        sort_node(self._model.root, 0)
+        sort_node(self._model.root, 0, True)
         if changed:
             self._annotations.leaf_groups.clear()
         return changed
@@ -1941,14 +2241,32 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _read_tree_state_payload(self, path_str: str) -> dict | None:
+        path = Path(path_str)
+        if path.suffix.lower() != ".json":
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if isinstance(payload, dict) and payload.get("format") == "phylo-tree-state":
+            return payload
+        return None
+
     def _import_config(self) -> None:
-        if not self._model:
-            QMessageBox.information(self, "提示", "请先打开一个树文件。")
-            return
         path_str, _ = QFileDialog.getOpenFileName(self, "导入配置文件", "", "配置文件 (*.yaml *.yml *.json);;所有文件 (*.*)")
         if not path_str:
             return
+        tree_state_payload = self._read_tree_state_payload(path_str)
+        if tree_state_payload is not None:
+            self._load_tree_state(tree_state_payload, Path(path_str))
+            self.statusBar().showMessage("已导入树状态文件。", 5000)
+            return
+        if not self._model:
+            QMessageBox.information(self, "提示", "请先打开一个树文件。")
+            return
         before = self._capture_history_state()
+        before_leaf_names = {node.id: (node.name or "") for node in self._model.iter_nodes() if node.is_leaf()}
         try:
             self._styles = load_and_apply_config(self._model, path_str)
         except Exception as exc:
@@ -1956,6 +2274,32 @@ class MainWindow(QMainWindow):
             return
         self._push_undo_state(before)
         self._rerender_current_tree()
+        summary = self._summarize_config_application(before_leaf_names, self._styles)
+        if not any(summary.values()):
+            QMessageBox.warning(
+                self,
+                "配置已导入",
+                "\n".join(
+                    [
+                        f"配置文件已读取：{path_str}",
+                        "",
+                        "但没有命中任何样品。",
+                        "现在样式会同时按“当前名称”和“原始名称”匹配。",
+                        "如果仍未生效，请检查配置中的物种名是否与树中的标签一致。",
+                    ]
+                ),
+            )
+            return
+        message = "，".join(
+            [
+                f"改名 {summary['renamed']} 个",
+                f"整体样式命中 {summary['label_styles']} 个",
+                f"局部样式命中 {summary['label_spans']} 个",
+                f"注释命中 {summary['annotations']} 个",
+            ]
+        )
+        self.statusBar().showMessage(f"配置导入完成：{message}。", 6000)
+        QMessageBox.information(self, "配置导入完成", f"{message}。")
 
     def _selected_tip_names(self) -> list[str]:
         if self._model is None:
@@ -2021,6 +2365,8 @@ class MainWindow(QMainWindow):
         if not leaf_order:
             return
         selected = list(dict.fromkeys(node_id for node_id in self._selected_ids if node_id in leaf_order))
+        if not selected and self._selected_node_id in leaf_order:
+            selected = [self._selected_node_id]
         if len(selected) < 1:
             QMessageBox.information(self, "提示", "请先选择至少一个样品后再新增分组。")
             return
@@ -2028,28 +2374,57 @@ class MainWindow(QMainWindow):
         if indices != list(range(indices[0], indices[-1] + 1)):
             QMessageBox.warning(self, "分组失败", "当前只支持连续样品分组。")
             return
-        dialog = GroupDialog(self)
+        dialog = GroupDialog(self, initial_color=self._next_group_palette_color())
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
         if not values["name"]:
+            QMessageBox.information(self, "提示", "请输入分组名称。")
             return
+        self._append_leaf_group(indices, leaf_order, values)
+
+    def _create_background_from_selection(self) -> None:
+        if not self._model:
+            return
+        leaf_order = self._current_leaf_order()
+        if not leaf_order:
+            return
+        selected = list(dict.fromkeys(node_id for node_id in self._selected_ids if node_id in leaf_order))
+        if not selected and self._selected_node_id in leaf_order:
+            selected = [self._selected_node_id]
+        if len(selected) < 1:
+            QMessageBox.information(self, "提示", "请先选择至少一个样品后再新增底色。")
+            return
+        indices = sorted(leaf_order.index(node_id) for node_id in selected)
+        if indices != list(range(indices[0], indices[-1] + 1)):
+            QMessageBox.warning(self, "新增底色失败", "当前只支持连续样品底色。")
+            return
+        dialog = GroupDialog(self, background_only=True, initial_color=self._next_group_palette_color())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        self._append_leaf_group(indices, leaf_order, values)
+
+    def _append_leaf_group(self, indices: list[int], leaf_order: list[str], values: dict, child_group_ids: list[str] | None = None) -> None:
         leaf_ids = [leaf_order[index] for index in indices]
         self._push_undo_state(self._capture_history_state())
         self._annotations.leaf_groups.append(
             LeafGroupAnnotation(
                 group_id=str(uuid4()),
-                name=values["name"],
+                name=values["name"] if values.get("show_marker", True) else (values["name"] or "底色"),
                 start_leaf_index=indices[0],
                 end_leaf_index=indices[-1],
                 color=values["color"],
+                show_marker=bool(values.get("show_marker", True)),
                 background_enabled=values["background_enabled"],
                 background_scope=values["background_scope"],
                 background_color_start=values["background_color_start"],
                 background_color_end=values["background_color_end"],
                 leaf_ids=leaf_ids,
+                child_group_ids=list(dict.fromkeys(child_group_ids or [])),
             )
         )
+        self._annotations.next_group_color_index += 1
         self._rerender_current_tree()
 
     def _create_group_from_selected_groups(self) -> None:
@@ -2073,29 +2448,15 @@ class MainWindow(QMainWindow):
         if indices != list(range(indices[0], indices[-1] + 1)):
             QMessageBox.warning(self, "分组失败", "上级分组覆盖的样品在当前树中必须连续。")
             return
-        dialog = GroupDialog(self)
+        dialog = GroupDialog(self, initial_color=self._next_group_palette_color())
         dialog.setWindowTitle("新增上级分组")
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
         if not values["name"]:
+            QMessageBox.information(self, "提示", "请输入分组名称。")
             return
-        self._push_undo_state(self._capture_history_state())
-        self._annotations.leaf_groups.append(
-            LeafGroupAnnotation(
-                group_id=str(uuid4()),
-                name=values["name"],
-                start_leaf_index=indices[0],
-                end_leaf_index=indices[-1],
-                color=values["color"],
-                background_enabled=values["background_enabled"],
-                background_scope=values["background_scope"],
-                background_color_start=values["background_color_start"],
-                background_color_end=values["background_color_end"],
-                child_group_ids=list(dict.fromkeys(group_ids)),
-            )
-        )
-        self._rerender_current_tree()
+        self._append_leaf_group(indices, leaf_order, values, child_group_ids=group_ids)
 
     def _refresh_group_list(self) -> None:
         if not hasattr(self, "_group_list"):
@@ -2103,7 +2464,10 @@ class MainWindow(QMainWindow):
         selected_ids = set(self._selected_group_ids())
         self._group_list.clear()
         for group in self._annotations.leaf_groups:
-            group_type = "上级" if group.child_group_ids else "叶组"
+            if not group.show_marker:
+                group_type = "底色"
+            else:
+                group_type = "上级" if group.child_group_ids else "叶组"
             item = QListWidgetItem(
                 f"{group.name} [{group.start_leaf_index + 1}-{group.end_leaf_index + 1}] L{group.level} {group_type}"
             )
@@ -2154,6 +2518,7 @@ class MainWindow(QMainWindow):
             return
         self._push_undo_state(self._capture_history_state())
         group.name = name.strip()
+        group.rich_html = None
         self._rerender_current_tree()
 
     def _recolor_group(self, group_id: str) -> None:
@@ -2216,22 +2581,31 @@ class MainWindow(QMainWindow):
             text += f":{float(node.branch_length):g}"
         return text
 
-    def _export_nwk(self) -> None:
-        if not self._model:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "导出 NWK", "", "Newick (*.nwk *.newick);;所有文件 (*.*)")
-        if not path:
-            return
-        text = self._tree_to_newick(self._model.root, True) + ";\n"
-        Path(path).write_text(text, encoding="utf-8")
+    def _default_export_prefix(self) -> str:
+        candidates: list[str] = []
+        if self._current_tree_path is not None:
+            candidates.append(self._current_tree_path.stem)
+        if self._model and self._model.name:
+            candidates.append(self._model.name)
+        for candidate in candidates:
+            prefix = re.sub(r'[\\/:*?"<>|]+', "_", candidate).strip().strip(".")
+            prefix = re.sub(r"\s+", "_", prefix)
+            if prefix:
+                return prefix
+        return "tree_export"
 
-    def _export_tree_state(self) -> None:
-        if not self._model:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "导出当前树状态", "", "Tree State (*.json);;所有文件 (*.*)")
-        if not path:
-            return
-        payload = {
+    def _default_export_path(self, filename: str) -> str:
+        if self._current_tree_path is not None:
+            return str(self._current_tree_path.with_name(filename))
+        return str(Path.cwd() / filename)
+
+    def _next_group_palette_color(self) -> str:
+        index = max(0, int(self._annotations.next_group_color_index))
+        return BASIC_COLOR_SEQUENCE[index % len(BASIC_COLOR_SEQUENCE)]
+
+    def _tree_state_payload(self) -> dict:
+        assert self._model is not None
+        return {
             "format": "phylo-tree-state",
             "model": {
                 "name": self._model.name,
@@ -2241,25 +2615,79 @@ class MainWindow(QMainWindow):
             "annotations": self._serialize_annotation_state(),
             "render_options": asdict(self._current_options()),
         }
-        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _export_svg(self) -> None:
+    def _write_nwk_file(self, path: Path) -> None:
+        assert self._model is not None
+        text = self._tree_to_newick(self._model.root, True) + ";\n"
+        path.write_text(text, encoding="utf-8")
+
+    def _write_tree_state_file(self, path: Path) -> None:
+        payload = self._tree_state_payload()
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _export_bundle(self) -> None:
         if not self._model:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "导出 SVG", "", "SVG (*.svg)")
-        if path:
-            self._viewer.export_svg(path)
+        initial_directory = str(self._current_tree_path.parent) if self._current_tree_path is not None else str(Path.cwd())
+        dialog = ExportBundleDialog(initial_directory, self._default_export_prefix(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        directory_text, prefix_text = dialog.values()
+        if not directory_text:
+            QMessageBox.information(self, "提示", "请先选择输出目录。")
+            return
+        prefix = prefix_text or self._default_export_prefix()
+        prefix = re.sub(r'[\\/:*?"<>|]+', "_", prefix).strip().strip(".")
+        prefix = re.sub(r"\s+", "_", prefix)
+        if not prefix:
+            QMessageBox.information(self, "提示", "文件前缀不能为空。")
+            return
+        output_dir = Path(directory_text)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            nwk_path = output_dir / f"{prefix}.nwk"
+            png_path = output_dir / f"{prefix}.png"
+            pdf_path = output_dir / f"{prefix}.pdf"
+            state_path = output_dir / f"{prefix}_state.json"
+            self._write_nwk_file(nwk_path)
+            self._viewer.export_png(str(png_path), scale=2.0)
+            self._viewer.export_pdf(str(pdf_path))
+            self._write_tree_state_file(state_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"一键导出失败：\n{exc}")
+            return
+        self.statusBar().showMessage(f"已导出到：{output_dir}", 5000)
+
+    def _export_nwk(self) -> None:
+        if not self._model:
+            return
+        default_path = self._default_export_path(f"{self._default_export_prefix()}.nwk")
+        path, _ = QFileDialog.getSaveFileName(self, "导出 NWK", default_path, "Newick (*.nwk *.newick);;所有文件 (*.*)")
+        if not path:
+            return
+        self._write_nwk_file(Path(path))
+
+    def _export_tree_state(self) -> None:
+        if not self._model:
+            return
+        default_path = self._default_export_path(f"{self._default_export_prefix()}_state.json")
+        path, _ = QFileDialog.getSaveFileName(self, "导出当前树状态", default_path, "Tree State (*.json);;所有文件 (*.*)")
+        if not path:
+            return
+        self._write_tree_state_file(Path(path))
 
     def _export_png(self) -> None:
         if not self._model:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "导出 PNG", "", "PNG (*.png)")
+        default_path = self._default_export_path(f"{self._default_export_prefix()}.png")
+        path, _ = QFileDialog.getSaveFileName(self, "导出 PNG", default_path, "PNG (*.png)")
         if path:
             self._viewer.export_png(path, scale=2.0)
 
     def _export_pdf(self) -> None:
         if not self._model:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "导出 PDF", "", "PDF (*.pdf)")
+        default_path = self._default_export_path(f"{self._default_export_prefix()}.pdf")
+        path, _ = QFileDialog.getSaveFileName(self, "导出 PDF", default_path, "PDF (*.pdf)")
         if path:
             self._viewer.export_pdf(path)

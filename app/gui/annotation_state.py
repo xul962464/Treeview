@@ -47,10 +47,13 @@ class LeafGroupAnnotation:
     end_leaf_index: int
     level: int = 0
     color: str = "#374151"
+    rich_html: str | None = None
+    show_marker: bool = True
     background_enabled: bool = False
     background_scope: str = "label"
     background_color_start: str | None = None
     background_color_end: str | None = None
+    offset: tuple[float, float] | None = None
     leaf_ids: list[str] = field(default_factory=list)
     child_group_ids: list[str] = field(default_factory=list)
 
@@ -61,7 +64,10 @@ class AnnotationState:
     node_label_overrides: dict[str, NodeLabelOverride] = field(default_factory=dict)
     scale_bar_label_override: ScaleBarLabelOverride | None = None
     clade_highlights: dict[str, CladeHighlight] = field(default_factory=dict)
+    branch_colors: dict[str, str] = field(default_factory=dict)
     leaf_groups: list[LeafGroupAnnotation] = field(default_factory=list)
     node_label_offsets: dict[str, tuple[float, float]] = field(default_factory=dict)
     tip_label_offsets: dict[str, tuple[float, float]] = field(default_factory=dict)
     scale_bar_offset: tuple[float, float] | None = None
+    preserve_root_order: bool = False
+    next_group_color_index: int = 0

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+build/
+dist/
+out.pdf
+out.png
+out.svg

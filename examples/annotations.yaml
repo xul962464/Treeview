@@ -1,0 +1,28 @@
+rename_rules:
+  - pattern: "---[A-Z]{2}_.+?--$"
+    repl: ""
+    ignore_case: false
+
+label_styles:
+  Lactuca_sativa---PP999685.1--:
+    color: "#111827"
+    fontFamily: "Segoe UI"
+    fontSize: 13
+    fontWeight: "bold"
+    nodeColor: "#f97316"
+
+label_spans:
+  Lactuca_sativa---PP999685.1--:
+    - pattern: "Lactuca"
+      regex: false
+      style:
+        color: "#2563eb"
+        fontWeight: "bold"
+    - pattern: "sativa"
+      regex: false
+      style:
+        color: "#059669"
+        fontWeight: "bold"
+
+annotations:
+  Lactuca_sativa---PP999685.1--: "[example-annotation]"

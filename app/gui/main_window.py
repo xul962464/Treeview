@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QTextCharFormat
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -480,6 +480,7 @@ class MainWindow(QMainWindow):
         self._redo_stack: list[HistoryState] = []
         self._syncing_controls = False
         self._view_drag_snapshot: HistoryState | None = None
+        self._startup_open_prompted = False
 
         self._init_menu()
         self._init_toolbar()
@@ -502,6 +503,13 @@ class MainWindow(QMainWindow):
         self._sync_node_label_controls()
         self._sync_scale_bar_controls()
         self._set_actions_enabled(False)
+        QTimer.singleShot(0, self._prompt_open_tree_on_startup)
+
+    def _prompt_open_tree_on_startup(self) -> None:
+        if self._startup_open_prompted or self._model is not None:
+            return
+        self._startup_open_prompted = True
+        self._open_tree_file()
 
     def _init_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件(&F)")
@@ -555,6 +563,9 @@ class MainWindow(QMainWindow):
         quick_replace_action = QAction("一键替换登录号格式", self)
         quick_replace_action.triggered.connect(self._quick_replace_accession_format)
         edit_menu.addAction(quick_replace_action)
+        move_accession_action = QAction("一键后移登录号", self)
+        move_accession_action.triggered.connect(self._move_leading_accession_to_end)
+        edit_menu.addAction(move_accession_action)
         quick_replace_underscore_action = QAction("一键替换下划线格式", self)
         quick_replace_underscore_action.triggered.connect(self._quick_replace_underscore_format)
         edit_menu.addAction(quick_replace_underscore_action)
@@ -616,9 +627,9 @@ class MainWindow(QMainWindow):
         sections = [
             CollapsibleSection("布局", self._build_layout_page(), True, container),
             CollapsibleSection("树调整", self._build_tree_page(), False, container),
-            CollapsibleSection("外观", self._build_appearance_page(), True, container),
+            CollapsibleSection("外观", self._build_appearance_page(), False, container),
             CollapsibleSection("样品标签", self._build_tip_label_page(), False, container),
-            CollapsibleSection("节点标签", self._build_node_label_page(), False, container),
+            CollapsibleSection("节点标签", self._build_node_label_page(), True, container),
             CollapsibleSection("分组注释", self._build_group_page(), False, container),
             CollapsibleSection("比例尺", self._build_scale_bar_page(), False, container),
         ]
@@ -784,6 +795,11 @@ class MainWindow(QMainWindow):
         self._support_size_spin.setRange(6, 32)
         self._support_size_spin.valueChanged.connect(self._on_support_size_changed)
         layout.addRow("置信度字号", self._support_size_spin)
+        self._cmb_support_display = NoWheelComboBox(self)
+        self._cmb_support_display.addItem("百分比 (0-100)", "percent")
+        self._cmb_support_display.addItem("小数 (0-1)", "decimal")
+        self._cmb_support_display.currentIndexChanged.connect(self._on_support_display_format_changed)
+        layout.addRow("置信度显示", self._cmb_support_display)
         self._node_circle_size_spin = NoWheelDoubleSpinBox(self)
         self._node_circle_size_spin.setRange(2.0, 32.0)
         self._node_circle_size_spin.setSingleStep(0.2)
@@ -943,6 +959,8 @@ class MainWindow(QMainWindow):
         self._font_combo.setCurrentFont(QFont(options.font_family))
         self._font_size_spin.setValue(options.font_size)
         self._support_size_spin.setValue(options.support_font_size)
+        support_index = self._cmb_support_display.findData(options.support_display_format)
+        self._cmb_support_display.setCurrentIndex(support_index if support_index >= 0 else 0)
         self._node_circle_size_spin.setValue(options.node_circle_size)
         self._node_offset_x_spin.setValue(options.support_offset_x)
         self._node_offset_y_spin.setValue(options.support_offset_y)
@@ -1141,7 +1159,7 @@ class MainWindow(QMainWindow):
         normalized.sort(key=lambda group: (group.level, group.start_leaf_index, group.end_leaf_index, group.name.lower()))
         self._annotations.leaf_groups = normalized
 
-    def _rerender_current_tree(self) -> None:
+    def _rerender_current_tree(self, *, auto_fit: bool = False) -> None:
         if self._model is None:
             return
         self._normalize_leaf_groups()
@@ -1150,7 +1168,7 @@ class MainWindow(QMainWindow):
         if not selected_ids and self._selected_node_id:
             selected_ids = [self._selected_node_id]
         self._viewer.set_selected_ids(selected_ids)
-        self._viewer.render_tree(self._model)
+        self._viewer.render_tree(self._model, auto_fit=auto_fit)
         self._viewer.clear_label_highlight()
         self._viewer.restore_selection(selected_ids)
         self._sync_node_label_controls()
@@ -1621,7 +1639,15 @@ class MainWindow(QMainWindow):
         node, _ = self._find_node_and_parent(self._model.root, node_id)
         if node is None or node.support is None:
             return ""
-        return f"{node.support:g}"
+        value = float(node.support)
+        mode = (self._current_options().support_display_format or "percent").lower()
+        if mode == "decimal":
+            if value > 1.0:
+                value /= 100.0
+            return f"{value:g}"
+        if value <= 1.0:
+            value *= 100.0
+        return f"{value:g}"
 
     def _scale_bar_default_text(self) -> str:
         return self._viewer.scale_bar_default_text(self._model)
@@ -1646,7 +1672,7 @@ class MainWindow(QMainWindow):
             self._reset_id_seq()
             self._reset_history()
             self._sync_controls_from_options()
-            self._rerender_current_tree()
+            self._rerender_current_tree(auto_fit=True)
             self._set_actions_enabled(True)
         except Exception as exc:
             QMessageBox.critical(self, "状态加载失败", f"无法加载树状态：\n{path}\n\n{exc}")
@@ -1667,10 +1693,13 @@ class MainWindow(QMainWindow):
     def _mutate_view_options(self, mutator) -> None:
         if self._syncing_controls:
             return
+        options = self._current_options()
+        before_options = asdict(options)
+        mutator(options)
+        if asdict(options) == before_options:
+            return
         if self._model is not None and self._view_drag_snapshot is None:
             self._push_undo_state(self._capture_history_state())
-        options = self._current_options()
-        mutator(options)
         self._viewer.set_render_options(options)
         self._sync_controls_from_options()
         self._rerender_current_tree()
@@ -1681,7 +1710,9 @@ class MainWindow(QMainWindow):
 
     def _end_view_drag(self) -> None:
         if self._view_drag_snapshot is not None:
-            self._push_undo_state(self._view_drag_snapshot)
+            current = self._capture_history_state()
+            if current is not None and current.render_options != self._view_drag_snapshot.render_options:
+                self._push_undo_state(self._view_drag_snapshot)
             self._view_drag_snapshot = None
 
     def _on_layout_changed(self, value: str) -> None:
@@ -1729,6 +1760,12 @@ class MainWindow(QMainWindow):
 
     def _on_support_size_changed(self, value: int) -> None:
         self._mutate_view_options(lambda o: setattr(o, "support_font_size", value))
+
+    def _on_support_display_format_changed(self, _index: int) -> None:
+        if self._syncing_controls:
+            return
+        mode = str(self._cmb_support_display.currentData() or "percent")
+        self._mutate_view_options(lambda o: setattr(o, "support_display_format", mode))
 
     def _on_node_offset_x_changed(self, value: float) -> None:
         if self._syncing_controls:
@@ -1781,10 +1818,7 @@ class MainWindow(QMainWindow):
         self._width_slider.setValue(value)
         self._width_spin.setValue(value)
         self._syncing_controls = False
-        options = self._current_options()
-        options.canvas_width = value
-        self._viewer.set_render_options(options)
-        self._rerender_current_tree()
+        self._mutate_view_options(lambda o: setattr(o, "canvas_width", value))
 
     def _on_height_changed(self, value: int) -> None:
         if self._syncing_controls:
@@ -1793,10 +1827,7 @@ class MainWindow(QMainWindow):
         self._height_slider.setValue(value)
         self._height_spin.setValue(value)
         self._syncing_controls = False
-        options = self._current_options()
-        options.canvas_height = value
-        self._viewer.set_render_options(options)
-        self._rerender_current_tree()
+        self._mutate_view_options(lambda o: setattr(o, "canvas_height", value))
 
     def _on_view_offset_x_changed(self, value: float) -> None:
         if self._syncing_controls:
@@ -1960,6 +1991,19 @@ class MainWindow(QMainWindow):
                 stack.append(child)
         return found, parent
 
+    def _remap_supports_for_reroot_path(self, target: TreeNode, parent: dict[str, TreeNode]) -> None:
+        path: list[TreeNode] = [target]
+        cur = target
+        while cur.id in parent:
+            cur = parent[cur.id]
+            path.append(cur)
+        if len(path) < 2:
+            return
+        old_supports = {node.id: node.support for node in path}
+        path[1].support = None
+        for index in range(2, len(path)):
+            path[index].support = old_supports.get(path[index - 1].id)
+
     def _reroot_to_selected(self) -> None:
         if not self._model or not self._selected_node_id:
             return
@@ -1982,6 +2026,7 @@ class MainWindow(QMainWindow):
         if par is None:
             return
         self._push_undo_state(before)
+        self._remap_supports_for_reroot_path(target, parent)
         length = float(target.branch_length or 0.0)
         try:
             par.children.remove(target)
@@ -2175,6 +2220,40 @@ class MainWindow(QMainWindow):
         self._push_undo_state(before)
         self._rerender_current_tree()
 
+    def _move_leading_accession_to_end_inplace(self) -> int:
+        if not self._model:
+            return 0
+        hit = 0
+        pattern = re.compile(r"^\s*([A-Z]{1,2}_?\d{6,}(?:\.\d+)?)\s+(.+?)\s*$")
+        for node in self._model.iter_nodes():
+            if not node.is_leaf():
+                continue
+            old = node.name or ""
+            match = pattern.match(old)
+            if not match:
+                continue
+            accession = match.group(1).strip()
+            label = match.group(2).strip()
+            if not label:
+                continue
+            new = f"{label} ({accession})"
+            if new != old:
+                node.name = new
+                hit += 1
+        return hit
+
+    def _move_leading_accession_to_end(self) -> None:
+        if not self._model:
+            return
+        before = self._capture_history_state()
+        hit = self._move_leading_accession_to_end_inplace()
+        if hit == 0:
+            self.statusBar().showMessage("没有位于开头的登录号需要后移。", 3000)
+            return
+        self._push_undo_state(before)
+        self._rerender_current_tree()
+        self.statusBar().showMessage(f"已后移 {hit} 个位于开头的登录号。", 4000)
+
     def _italicize_all_tip_labels_inplace(self) -> int:
         if not self._model:
             return 0
@@ -2213,15 +2292,17 @@ class MainWindow(QMainWindow):
         before = self._capture_history_state()
         accession_hit = self._quick_replace_accession_format_inplace()
         underscore_hit = self._quick_replace_underscore_format_inplace()
+        move_accession_hit = self._move_leading_accession_to_end_inplace()
         italic_hit = self._italicize_all_tip_labels_inplace()
         sorted_changed = self._sort_tree_by_topology_depth_inplace()
-        if accession_hit == 0 and underscore_hit == 0 and italic_hit == 0 and not sorted_changed:
+        if accession_hit == 0 and move_accession_hit == 0 and underscore_hit == 0 and italic_hit == 0 and not sorted_changed:
             self.statusBar().showMessage("自动调整未检测到需要更新的内容。", 4000)
             return
         self._push_undo_state(before)
         self._rerender_current_tree()
         parts = [
             f"登录号替换 {accession_hit}",
+            f"登录号后移 {move_accession_hit}",
             f"下划线替换 {underscore_hit}",
             f"一键斜体 {italic_hit}",
             f"排序 {'已执行' if sorted_changed else '未变化'}",

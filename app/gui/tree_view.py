@@ -41,7 +41,8 @@ class TreeRenderOptions:
     font_family: str = "Arial"
     font_size: int = 16
     support_font_size: int = 12
-    support_color: str = "#4b5563"
+    support_color: str = "#000000"
+    support_display_format: str = "percent"
     support_offset_x: float = -36.0
     support_offset_y: float = -22.0
     view_offset_x: float = 0.0
@@ -489,7 +490,7 @@ class TreeView(QGraphicsView):
 
         return RenderContext(leaf_order, leaf_index, x_raw, y_raw, max(x_raw.values()) if x_raw else 0.0, max(y_raw.values()) if y_raw else 0.0)
 
-    def render_tree(self, model: TreeModel) -> TreeRenderStats:
+    def render_tree(self, model: TreeModel, *, auto_fit: bool = True) -> TreeRenderStats:
         self._last_model = model
         self.clear()
         context = self._collect_context(model)
@@ -502,7 +503,8 @@ class TreeView(QGraphicsView):
         items_rect = self._scene.itemsBoundingRect().adjusted(-24.0, -24.0, 24.0, 24.0)
         target_rect = items_rect.united(canvas_rect) if not items_rect.isNull() else canvas_rect
         self._scene.setSceneRect(target_rect)
-        self.fitInView(target_rect, Qt.AspectRatioMode.KeepAspectRatio)
+        if auto_fit:
+            self.fitInView(target_rect, Qt.AspectRatioMode.KeepAspectRatio)
         return TreeRenderStats(len(model.iter_nodes()), len(context.leaf_order))
 
     def restore_selection(self, node_ids: list[str]) -> None:
@@ -588,7 +590,7 @@ class TreeView(QGraphicsView):
                 self._scene.addItem(vh)
                 self._edge_items.setdefault(node.id, []).append(vh)
                 if options.show_support_labels and node.support is not None and node.id != model.root.id:
-                    sup = self._create_node_label_item(node, f"{node.support:g}")
+                    sup = self._create_node_label_item(node, self._format_support_text(node.support))
                     self._set_node_label_pos(node.id, sup, x0 + options.support_offset_x, px_y(node.id) + options.support_offset_y)
                     sup.setData(0, node.id)
                     sup.setData(1, ("support", node.id))
@@ -1101,7 +1103,7 @@ class TreeView(QGraphicsView):
         x = x_left if options.scale_bar_position == "left" else float(options.canvas_width) - width - 60.0
         pen = QPen(QColor(options.branch_color))
         pen.setWidthF(options.branch_width)
-        font = QFont(options.font_family, max(9, options.font_size - 1))
+        font = QFont(options.font_family, max(6, int(options.support_font_size)))
         color = QColor("#111827")
         label = QGraphicsSimpleTextItem(f"{length:g}", parent)
         label.setFont(font)
@@ -1272,7 +1274,7 @@ class TreeView(QGraphicsView):
                 self._scene.addItem(hit)
                 self._edge_items.setdefault(child.id, []).append(hit)
                 if options.show_support_labels and child.support is not None and not child.is_leaf():
-                    sup = self._create_node_label_item(child, f"{child.support:g}")
+                    sup = self._create_node_label_item(child, self._format_support_text(child.support))
                     self._set_node_label_pos(child.id, sup, p1.x() + options.support_offset_x, p1.y() + options.support_offset_y)
                     sup.setData(0, child.id)
                     sup.setData(1, ("support", child.id))
@@ -1449,6 +1451,19 @@ class TreeView(QGraphicsView):
 
     def _plain_text_html(self, text: str) -> str:
         return html.escape(text or "").replace("\n", "<br/>")
+
+    def _format_support_text(self, support: float | None) -> str:
+        if support is None:
+            return ""
+        value = float(support)
+        mode = (self._render_options.support_display_format or "percent").lower()
+        if mode == "decimal":
+            if value > 1.0:
+                value /= 100.0
+            return f"{value:g}"
+        if value <= 1.0:
+            value *= 100.0
+        return f"{value:g}"
 
     def _create_tip_label_item(self, node_id: str, display_text: str, html_text: str, font: QFont, color: QColor) -> QGraphicsTextItem:
         label = MovableTextItem(
